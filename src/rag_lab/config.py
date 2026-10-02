@@ -21,7 +21,7 @@ class ParseConfig(_Section):
     table_cell_matching: bool = True
     do_formula_enrichment: bool = False
     do_code_enrichment: bool = False
-    num_threads: int = 4
+    num_threads: int = 8
     document_timeout: float = 600.0
 
 
@@ -75,6 +75,14 @@ class IndexConfig(_Section):
     hnsw_m: int = 16
     hnsw_ef_construct: int = 100
     hnsw_ef: int | None = None  # search-time ef; None uses the Qdrant default
+
+
+class BenchmarkConfig(_Section):
+    """Settings of one search benchmark run. Not part of the experiment, so not in the config hash."""
+
+    top_k: int = 10  # quality metrics are computed for k in 1, 3, 5, 10 up to this value
+    repeats: int = 5  # timed passes over the query set, after one warm-up pass
+    queries_file: str = "eval/queries.yaml"
 
 
 class ExperimentConfig(_Section):

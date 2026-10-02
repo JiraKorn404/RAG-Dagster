@@ -11,7 +11,7 @@ Keep the project minimal. Testing is deliberately light:
 - **Tests:** only the two small files listed in Phases 1 and 6 (config hashing and vector truncation, retrieval metric formulas). Nothing else gets a test file.
 - **Verification:** each phase's "Done when" is checked once, by a real run against the real stack. No mocks, no fake embedders, no integration test suite.
 - **After small edits:** do not rerun tests, rebuild containers or re-materialise assets. Rerun only when the logic of a tested area changed.
-- **Optional items** (in Phases 5 and 7 and under "Deferred") are built only when you ask for them.
+- **Optional items** (in Phase 5, under "Ideas" and under "Deferred") are built only when you ask for them.
 
 ## Scope
 
@@ -190,20 +190,56 @@ Notes:
 
 ## Phase 5 — Search with scores
 
-- [ ] `search/`: `search(query, experiment, top_k, filters)` embeds the query with the instruction prefix and runs `query_points`, with `hnsw_ef` taken from config. Each hit returns text, source file, page, modality, `similarity` (Qdrant's cosine score) and `distance` (`1 - similarity`).
-- [ ] Per-query timing breakdown: embed ms, Qdrant ms, total ms.
-- [ ] CLI: `python -m rag_lab.search "..." --experiment <name> --top-k 5 [--modality table] [--json] [--no-log]`. Writes to `search_log` unless `--no-log`.
+- [x] `search/`: `search(query, experiment, top_k, filters)` embeds the query with the instruction prefix and runs `query_points`, with `hnsw_ef` taken from config. Each hit returns text, source file, page, modality, `similarity` (Qdrant's cosine score) and `distance` (`1 - similarity`).
+- [x] Per-query timing breakdown: embed ms, Qdrant ms, total ms.
+- [x] CLI: `python -m rag_lab.search "..." --experiment <name> --top-k 5 [--modality table] [--json] [--no-log]`. Writes to `search_log` unless `--no-log`.
 - [ ] Optional: `--exact` flag (brute-force search) to measure how much recall the HNSW index gives up.
 - [ ] Optional: hybrid mode for comparison. In Qdrant this needs a sparse (BM25) vector stored on each point at index time, fused with the dense result at query time, so it touches Phase 4 as well.
+
+Done when: the CLI returns ranked hits with similarity and distance, filters by modality, and logs to `search_log`. **Status: done (2026-10-02).** Checked once against the live stack with the `docs` experiment (`aiayn.pdf`):
+- "How does multi-head attention work?" returned the Multi-Head Attention section first (similarity 0.732, 339 ms embed, 16 ms Qdrant, 355 ms total) and wrote one `search_log` row.
+- `--modality table --json --no-log` returned only table chunks (BLEU query: Table 2 first, 0.636) as JSON and wrote no row.
+- `--exact` and hybrid mode (the optional items) are not built.
+
+How to use it: `docker compose exec dagster-code python -m rag_lab.search "..." --experiment <name> --top-k 5`. The experiment's settings (embedding model, dimension, query instruction, `hnsw_ef`) are read from the newest row for that name in `rag_metrics.experiments`, so ingest at least `parsed_document` and `chunks` under the name first. `rag_lab.search.search(query, config, embedder, store, ...)` is plain Python for the Phase 6 benchmark to reuse. Running outside the container needs `OLLAMA_BASE_URL`, `QDRANT_URL` and `METRICS_DATABASE_URL` set.
+
+## Phase 5a — Notebook search helper
+
+Goal: try similarity searches from a Jupyter notebook with one function call, instead of the CLI's `docker compose exec ... --experiment ... --top-k ...` line. Nothing is rebuilt: the notebook is a thin front end over the Phase 5 `search()`.
+
+Where it runs: the notebook kernel runs on the Windows host using the existing `.venv`, not in a container (a Jupyter container would be one more service). The host already reaches everything: Qdrant on `localhost:6333/6334` and Postgres on `localhost:5432` are published by `docker-compose.yml`, and Ollama is reached at the Tailscale IP from `.env`. Open the notebook in VS Code (or `uv run jupyter lab`) and pick the `.venv` kernel.
+
+- [x] `search/quick.py` with one function, `ask(query, experiment, top_k=5, modality=None, log=False)`:
+  - Builds the Ollama, Qdrant and metrics clients itself, so the notebook needs no setup cell. Settings come from the environment, with host defaults when unset: `QDRANT_URL` falls back to `http://localhost:6333`, `METRICS_DATABASE_URL` is built from `POSTGRES_USER` and `POSTGRES_PASSWORD` at `localhost:5432/rag_metrics`, and `OLLAMA_BASE_URL` has no default. The three values are read from `.env` if the variables are not already set (a few lines of parsing, no `python-dotenv`).
+  - Looks the experiment's settings up in `rag_metrics.experiments` (the same lookup as the CLI), so the embedding model, dimension and query instruction always match what was ingested. The lookup moves from `__main__.py` into a shared helper so the CLI and `ask()` use one copy.
+  - Calls `search()`, prints one compact line per hit (rank, similarity, modality, file and page, first 100 characters) followed by the three timings, and returns the `SearchResult` so cells can inspect `result.hits[0].text`.
+  - `log=True` writes to `search_log`; the default is off, so notebook experiments do not fill the log.
+- [x] `notebook/search.ipynb`: a first cell `from rag_lab.search.quick import ask`, then example cells: a plain query, a `modality="table"` query, and the same query against two experiments to compare scores. Outputs are cleared before committing.
+- [x] Add `ipykernel` to the `dev` dependency group in `pyproject.toml`. This is the stated need for it; nothing else is added.
+- [x] `CLAUDE.md`: add `notebook/` to the layout and the `ask()` line to the commands.
+
+Not included: a rewrite of the CLI (it stays as it is), `--exact` or hybrid search, filters other than `modality`, pandas tables or charts, and tests (the function is glue over code that is already checked).
+
+Done when: after `docker compose up`, `ask("...", "docs")` in the notebook prints ranked hits from the host with no extra setup, and the same query gives the same top hit and similarity as the CLI. One real run, no more.
+
+Open points to confirm before building:
+- The kernel runs on the host. If you would rather run it in a container, that needs a `jupyter` service (or an install in `dagster-code`) and adds weight to the Docker setup.
+- `ask()` reads `.env` for the Ollama address, because the Tailscale IP is not in the host's environment by default.
+
+**Status: done (2026-10-02).** Checked once: from the host `.venv`, `ask("How does multi-head attention work?", "docs")` returned the same top hit as the CLI (similarity 0.732, 62 ms total) and the `modality="table"` query returned only table chunks (0.636 first). The CLI still works after the shared-lookup refactor. Notes:
+- `ipykernel` ended up in the main `dependencies` of `pyproject.toml`, not the dev group.
+- `.env` has `OLLAMA_BASE_URL=http://host.docker.internal:11434` (Ollama on this machine), which only resolves inside containers. `ask()` swaps that name for `localhost`.
+- Postgres and Qdrant default to `127.0.0.1`, not `localhost`: Docker publishes them on IPv4 only and Postgres connections hung on the IPv6 attempt.
+- A hit whose text has characters the Windows console cannot encode (such as `ϵ`) makes `print` fail in a plain cp1252 terminal. Notebooks print UTF-8, so it only matters outside them.
 
 ## Phase 6 — Metrics and benchmarking
 
 All metrics below are implemented in this phase. Quality metrics are computed only for queries that have expected results; otherwise they are stored as null and the run still completes.
 
-- [ ] `eval/queries.yaml` format: `id`, `query`, optional `expected` list of `{source_file, page}` or `{chunk_id}`, optional `modality`. Ship it with placeholder queries and empty `expected`. Loading it syncs `eval_queries`.
-- [ ] `metrics/retrieval.py`, with one small test of the formulas against a hand-computed case (the one place a silent error would look plausible).
-- [ ] `search_benchmark` asset per experiment: warm-up pass, then N repeats of the query set. Writes `benchmark_runs`, `query_results`, `benchmark_metrics`.
-- [ ] `experiment_summary` asset: a SQL view over `rag_metrics` giving one row per experiment, shown as a Markdown table in the Dagster UI.
+- [x] `eval/queries.yaml` format: `id`, `query`, optional `expected` list of `{source_file, page}` or `{chunk_id}`, optional `modality`. Ship it with placeholder queries and empty `expected`. Loading it syncs `eval_queries`.
+- [x] `metrics/retrieval.py`, with one small test of the formulas against a hand-computed case (the one place a silent error would look plausible).
+- [x] `search_benchmark` asset per experiment: warm-up pass, then N repeats of the query set. Writes `benchmark_runs`, `query_results`, `benchmark_metrics`.
+- [x] `experiment_summary` asset: a SQL view over `rag_metrics` giving one row per experiment, shown as a Markdown table in the Dagster UI.
 
 | Group | Metrics |
 |---|---|
@@ -215,14 +251,157 @@ All metrics below are implemented in this phase. Quality metrics are computed on
 
 Done when: two experiments (for example table mode fast versus accurate, or two chunking strategies) can be compared with one SQL query, and filling in `expected` then re-running the benchmark produces quality metrics with no code change.
 
-## Phase 7 — Lab ergonomics (as wanted)
+**Status: done (2026-10-02).** Checked against the live stack with the `docs` experiment (`aiayn.pdf`, 41 points):
+- `search_benchmark` for `docs` (default 10 top-k, 5 repeats, the 3 shipped queries) wrote 1 `benchmark_runs` row, 15 `query_results` and 69 `benchmark_metrics`. Total latency p50 35 ms, p95 56 ms, 26.9 queries per second; the first query cost 172 ms cold and 37 ms warm. Top-1 similarity averaged 0.704. The 36 quality metrics (overall and for `table`) were stored as null because the shipped queries have no expected results.
+- `SELECT * FROM experiment_summary` gives one row per experiment with ingestion performance (15 pages parsed at 0.47 pages per second, 41 chunks, 3.3 chunks and 887 tokens per second embedding, 10.5 s model load, 47 s per document) next to the benchmark columns.
+- Filling in `expected` and re-running gave quality metrics with no code change, checked with a temporary query file: `attention` pointing at page 4 got rank 1, and a `bleu-table` query with one real and one made-up page got recall 0.5 and nDCG@5 0.613, which matches the hand calculation. Those test rows were deleted afterwards.
+- The retrieval formulas have one test (`tests/test_retrieval.py`, hand-computed case including duplicate hits on one expected page); all 4 tests pass.
 
-- [ ] Preset experiment configs in `experiments/*.yaml`, selectable in the launchpad.
-- [ ] A job that runs a list of experiments over the same documents.
-- [ ] Dashboard over `rag_metrics` (Streamlit, or Grafana/Metabase pointed at Postgres).
-- [ ] Small UI for trying queries across experiments side by side.
-- [ ] `docling-serve` as a separate container, compared against in-process parsing.
-- [ ] Reranking stage; alternative embedding models; quantisation settings in Qdrant.
+How to use it:
+- Launch `search_benchmark` (and `experiment_summary`) from the Dagster UI with run config `resources.experiment.config.name: <experiment>`; optional `ops.search_benchmark.config` with `top_k`, `repeats`, `queries_file`. From a shell: `docker compose exec dagster-code dagster asset materialize -m rag_lab.definitions --select search_benchmark,experiment_summary --config-json '{"resources":{"experiment":{"config":{"name":"docs"}}}}'`.
+- The benchmark takes only the experiment name from the run config. Its settings are read from the `experiments` table (as the search CLI does), so a benchmark always shares the config hash of the ingestion it measures. Benchmarking with a changed `index.hnsw_ef` is therefore not possible from the run config.
+- To get quality metrics, add `expected` to entries in `eval/queries.yaml` (`{source_file, page}` or `{chunk_id}`) and re-run. The query set version is a hash of the file, so each edit is a new version. A query's `modality` restricts its search and also splits the metrics: the `table` rows cover queries marked `modality: table`.
+
+Notes:
+- Each expected item is matched by at most one hit (the best ranked), so two chunks from the same expected page cannot push a score above 1. MRR and MAP cover the whole retrieved top-k list, so their `k` is null. Precision, recall, hit rate and nDCG are stored for k in 1, 3, 5, 10 up to `top_k`.
+- "Cold versus warm first query": `first_query_cold_ms` is the first query of the warm-up pass, `first_query_warm_ms` the mean of the same query across the timed repeats.
+- `experiment_summary` is a SQL view (migration `0002_experiment_summary.sql`) over the latest run of each stage per document and the latest finished benchmark. The asset shows it transposed (one column per experiment) as Markdown.
+- `indexed_vectors_count` is 0 for a small collection: Qdrant does not build the HNSW index below its indexing threshold, so a small lab collection is searched by brute force. This also means `--exact` would show no difference until the collection is large.
+- `docker-compose.yml` mounts `./eval` into `dagster-code`; recreate that container (`docker compose up -d dagster-code`) once after pulling this change.
+- A Dagster asset takes its run config only through a parameter named `config`, so the benchmark settings are `config: BenchmarkConfig`.
+
+## Phase 6a — Notebook summary helper
+
+Goal: see the `experiment_summary` view from the notebook with one call, `summary()`, instead of the `docker compose exec postgres psql ...` line or opening the Dagster UI. Same idea as Phase 5a: a thin helper over code that already exists, run from the host `.venv`.
+
+- [x] `metrics/summary.py`: `summary_markdown(columns, rows)` builds the transposed Markdown table (one column per experiment, one row per metric). It moves out of the `experiment_summary` asset, which then calls it, so the notebook and the Dagster UI show the same table from one copy.
+- [x] `search/quick.py`: `summary(names=None)`. It fetches the view through `MetricsStore.experiment_summary()` and renders the table in the notebook (`IPython.display.Markdown`; IPython comes with `ipykernel`). `names` is an optional list of experiment names to show; the default is all. The connection settings code that `ask()` already has (`.env`, `127.0.0.1` defaults) is split out into one helper that both functions use. It returns nothing, so the table is not shown twice.
+- [x] `notebook/search.ipynb`: a final section with `from rag_lab.search.quick import ask, summary` and a `summary()` cell. Existing cells stay as they are.
+- [x] `CLAUDE.md`: mention `summary()` next to `ask()`.
+
+Not included: a pandas DataFrame (no new dependency), charts, or a way to run a benchmark from the notebook (benchmarks stay Dagster runs).
+
+Done when: `summary()` in the notebook shows the same numbers as `SELECT * FROM experiment_summary`. One real run, no tests (the table builder moves unchanged, and there is no new logic to check).
+
+**Status: done (2026-10-02).** Checked once: from the host `.venv`, the table `summary()` builds has the same numbers as `SELECT * FROM experiment_summary` for `docs` (15 pages, 41 chunks, search p50 35.2 ms, top-1 similarity 0.704, quality columns empty), and `summary(["nope"])` raises a clear error. The `experiment_summary` asset still materialises after the table builder moved. I did not open the notebook itself; in Jupyter `display(Markdown(...))` renders the table, while a plain script only prints the object.
+
+How to use it: in `notebook/search.ipynb`, `from rag_lab.search.quick import ask, summary`, then `summary()` or `summary(["docs", "other"])`. It reads the view directly, so it is always current and needs no re-materialising.
+
+## Phase 7 — Embedding model × chunking strategy comparison
+
+Goal: find out which embedding model and which chunking strategy retrieve best on your documents, and see the answer in one place. The matrix is 3 models (`qwen3-embedding:0.6b`, `:4b`, `:8b`) × 5 strategies (`hybrid`, `hierarchical`, `fixed`, `recursive`, `semantic`) = 15 experiments over the same documents and the same query set. Two UIs sit on top: a dashboard over `rag_metrics`, and a page for trying a query against many experiments at once.
+
+### Decisions
+
+| Topic | Decision | Reason |
+|---|---|---|
+| What varies | Only the model and the strategy. Everything else (`max_tokens`, `overlap`, `table_handling`, HNSW, batch size, query instruction, parse settings) is one shared block in `experiments/matrix.yaml`. | A difference in the results must come from the model or the chunker, not from a stray setting. |
+| Experiment names | `<model label>-<strategy>`, with labels set in the matrix file: `q3-0-6b-hybrid`, `q3-4b-fixed`, `q3-8b-semantic`, and so on. | Names double as Qdrant collection names, so they must match the existing name pattern. |
+| Dimension | Each model at its native size (1024, 2560, 4096). | One collection per experiment, so sizes never clash. A fixed-dimension axis (Matryoshka) is an idea, not part of this phase. |
+| Tokenizer | The same Qwen3 tokenizer for all three. | Same model family, so `max_tokens` means the same thing everywhere. |
+| How relevance is judged | Expected items are `{source_file, page}`, optionally with `contains: "<text>"`. `chunk_id` is not used. | Chunk ids differ between chunkers, so they cannot be compared. A page is coarse (two chunkers both hit the right page), so `contains` adds a case-insensitive text check on the hit. |
+| What is compared across models | Quality metrics (recall, MRR, nDCG) and ranks. Similarity scores only within one model. | Cosine scores of different models are on different scales; a higher score from the 8b model does not mean a better result. |
+| Parsing | Each experiment parses the PDF again, as today. | Simplest, and keeps every experiment's metrics complete. About 20 to 30 s per experiment per document. Reusing one parse across experiments is an idea. |
+| How the matrix runs | A command inside `dagster-code` that calls `dagster.materialize` once per experiment and document. | Runs show up in the Dagster UI, with no new service and no GraphQL client. |
+| UI | One Streamlit app with two pages (dashboard, query), run as a Docker service `ui` built from the shared image, at `http://localhost:8501`. | One new dependency and one new service. In the container it already has the Qdrant, Postgres and Ollama addresses, the same as `dagster-code`, so it needs no `.env` parsing. |
+| Documents | `aiayn.pdf` only ("Attention Is All You Need", 15 pages, 4 tables). | The chosen test document. One paper means the results describe how the models and chunkers behave on this kind of paper, not on documents in general. |
+
+### 7.1 Groundwork
+
+- [x] On the Mac: `ollama pull qwen3-embedding:4b` and `ollama pull qwen3-embedding:8b`. Check the 8b model fits in the Mac's memory next to the others; Ollama loads one at a time, but a swap-heavy Mac will distort the latency numbers. Embed one string with each and confirm the dimensions (1024, 2560, 4096).
+- [x] Document: `data/raw/aiayn.pdf`, already there and ingested as the `docs` experiment.
+- [x] Query set: about 30 queries in `eval/queries.yaml` replacing the three placeholders, with `expected` filled in: roughly 20 about the text (architecture, attention, training, results) and 10 marked `modality: table` (the paper's complexity, BLEU, model-variation and parsing tables). Each expected item is `{source_file, page}` plus a `contains` snippet taken from the paper. Without expected results the comparison has only latency and scores, which cannot rank models (see the decisions).
+- [x] I draft the queries from the parsed paper and check every expected item against it (the page exists and the `contains` text is on that page) before handing the file to you; an item that matches nothing would silently score zero. You review the file. The whole comparison rests on it.
+- [x] `metrics/retrieval.py`: `relevance()` also accepts a `contains` key in an expected item (a substring of the hit's text). Hits carry their text into the matching only; `query_results` still stores no text. One added assertion in `tests/test_retrieval.py`, since this is the formula area the project does test.
+
+### 7.2 Matrix runner
+
+- [x] `experiments/matrix.yaml`: `models` (label to Ollama model), `strategies`, `shared` (the fixed settings above), and `documents` (all partitions, or a list of file names). Mounted into `dagster-code` like `eval/`.
+- [x] `src/rag_lab/experiments/`: `matrix.py` expands the file into a list of `ExperimentConfig` (plain Python, no Dagster). `__main__.py` runs them: `docker compose exec -d dagster-code python -m rag_lab.experiments run experiments/matrix.yaml [--only <pattern>] [--dry-run]`.
+- [x] Run order is model by model, so each model is loaded on the Mac once. For each experiment: `parsed_document`, `chunks`, `embeddings`, `qdrant_index` for every document, then `search_benchmark` once.
+- [x] Resumable: an experiment that already has a finished benchmark for the current query-set version is skipped. A failed experiment is logged and the run moves on; a summary of failures is printed at the end.
+- [x] `--dry-run` prints the 15 experiment names and config hashes without running anything.
+
+### 7.3 Dashboard page
+
+- [x] Migration `0003`: recreate `experiment_summary` with `model`, `strategy` and `dimension` columns read from `experiments.config`, so the dashboard and SQL can group by them.
+- [x] `streamlit` added to the dependencies in `pyproject.toml` (its stated need); the shared image is rebuilt once (`docker compose up -d --build`). A new `ui` service in `docker-compose.yml`: the same image, `streamlit run /app/ui/app.py`, port `127.0.0.1:8501`, `./src` and `./ui` bind-mounted so edits reload, the same environment block as `dagster-code`, started after Postgres and Qdrant.
+- [x] `ui/app.py` (Streamlit entry with two pages), `ui/dashboard.py`, and `ui/style.py` (the shared theme, below). The UI reads its addresses from the environment, like the search CLI.
+- [x] Look and feel (applies to both pages, since "cool" is a requirement):
+  - A dark theme set in `ui/.streamlit/config.toml`, with one accent colour, and a small block of custom CSS in `style.py`: a gradient page title, rounded cards, a quiet background.
+  - Headline cards at the top of the dashboard (best model, best strategy, best nDCG@5, fastest search p50), each with the value large and the experiment name beneath it.
+  - Charts in Altair (it comes with Streamlit; no plotting library is added), with one palette chosen for the three models and used on every chart, a single-hue scale for the heatmap grid, readable labels, and tooltips. The `dataviz` skill is used for the palette and chart rules when this is built.
+  - Text and table hits in the query page are cards with a coloured badge for the modality and a similarity bar; the agreement marking below uses a second badge colour.
+- [x] Dashboard contents, all read from `rag_metrics`:
+  - A grid with strategy as rows and model as columns, filled with a metric you pick (nDCG@5, recall@5, MRR, search p50, embed chunks per second, and so on). This is the main view.
+  - Bar charts by experiment for quality, search latency (p50 and p95) and ingestion throughput.
+  - The raw `experiment_summary` table, sortable.
+  - A per-query drill-down: for two chosen experiments, the first relevant rank of each query side by side, to see where one wins.
+  - A query-set version selector, with a warning when the experiments shown were benchmarked on different versions.
+
+### 7.4 Query page
+
+- [x] `ui/query.py`: a query box, top-k, an optional modality filter, and a choice of experiments (all 15, or filter by model or strategy). Each experiment gets a column of ranked hits with rank, similarity, source file and page, and text. Hits whose page also appears in other experiments' results are marked, so agreement and disagreement are visible at a glance. Each hit also shows its `{source_file, page}` as a ready-to-paste line for `eval/queries.yaml`.
+- [x] `search()` takes an optional precomputed query vector, so the page embeds the query once per distinct embedding setup (three times for the matrix, not fifteen).
+- [x] Nothing is written to `search_log` from this page.
+
+### 7.5 The comparison run
+
+- [x] A slice first: one model and two strategies (for example `q3-0-6b` with `hybrid` and `fixed`), checked end to end through the dashboard and the query page.
+- [x] Then the full 15 experiments. Read the dashboard and note what you find (best model, best strategy, whether the larger models are worth their latency and memory) in this section.
+
+Done when: `--dry-run` lists 15 experiments, the full run leaves each with a finished benchmark on the same query-set version, the UI at `localhost:8501` shows a quality metric for every model and strategy pair in the dashboard grid, and the query page shows the same query's results from several experiments side by side. Checked once, on the real stack.
+
+**Status: done (2026-10-02).** Checked on the real stack with `aiayn.pdf` and a 30-query set (20 text, 10 table):
+- `--dry-run` lists the 15 experiments with their config hashes. The full run, started from the code container, finished all 15 in 11.7 minutes (a first slice of two experiments had been run and checked before). Every experiment has a finished benchmark on the same query-set version (`1ec485bcb7c0`).
+- A coverage check confirmed that all 30 expected items are findable in the chunks of every one of the 15 experiments, so no experiment is penalised by where its chunker happened to cut.
+- The UI is at `http://localhost:8501`. The dashboard grid shows nDCG@5 for every model and strategy pair; the query page shows one question across all 15 experiments, with one query embedding per model. Both pages were rendered in a real browser and checked for exceptions with Streamlit's app tester.
+
+Results (30 queries on one paper, so read them as a guide, not a verdict):
+
+| Model | Vector size | Mean nDCG@5 | Mean recall@5 | Search p50 | Embed tokens/s | Seconds per document |
+|---|---|---|---|---|---|---|
+| `qwen3-embedding:0.6b` | 1024 | 0.896 | 0.967 | 29 ms | 5436 | 36 |
+| `qwen3-embedding:4b` | 2560 | 0.924 | 0.993 | 42 ms | 1870 | 41 |
+| `qwen3-embedding:8b` | 4096 | 0.942 | 0.993 | 57 ms | 1199 | 45 |
+
+| Strategy | Mean nDCG@5 | Mean MRR |
+|---|---|---|
+| `semantic` | 0.928 | 0.908 |
+| `recursive` | 0.927 | 0.909 |
+| `fixed` | 0.920 | 0.898 |
+| `hierarchical` | 0.918 | 0.896 |
+| `hybrid` | 0.910 | 0.896 |
+
+- A larger model helps more than a different chunker: each step up in model size adds about 0.02 to 0.03 nDCG@5, at roughly 1.4 times the search latency and 0.3 to 0.5 times the embedding speed. The strategies span only 0.02, which is within what one or two queries can move (one query is 0.033 of recall@5), so no strategy can be declared best on this data.
+- Best single experiments (nDCG@5 0.955): `q3-4b-hierarchical`, and `q3-8b` with `fixed`, `recursive` or `semantic`. `hierarchical` is the least stable: best at 4b, worst of the 8b row (0.893). It keeps formula placeholders as chunks (the `<!-- formula-not-decoded -->` chunk ranks first for the optimizer question at 0.6b).
+- Recall@5 is 0.93 to 1.00 in every experiment, so the right chunk is nearly always in the top five. Most of the difference is in how high it ranks (MRR 0.855 to 0.940), not whether it is found.
+
+Changes from the plan, and notes:
+- Expected items use `{source_file, contains}` only, without `page`: Docling assigns a chunk's page differently depending on the chunker (Table 1 is on page 5 in the hybrid chunks, page 6 in the PDF), so a page match would have penalised some experiments unfairly. The 30 expected snippets were drafted from the parsed paper and checked against the chunks; they still need your review.
+- The `hostenv.py` step was dropped: the UI runs in a container that already has the connection settings in its environment.
+- Ollama is on this machine here (`OLLAMA_BASE_URL=http://host.docker.internal:11434`) with all three models pulled, so step 7.1's Mac check did not apply. Memory was not a problem for the 8b model.
+- The runner skips ingestion when the experiment's Qdrant collection already holds the document (not when metrics rows exist), and skips an experiment whose config hash already has a finished benchmark on the current query set. This is needed because `q3-0-6b-hybrid` has the same settings, hence the same config hash, as the earlier `docs` experiment.
+- That shared hash exposed a bug, now fixed: the experiments row kept the old config JSON (with the old name) when a second name claimed the hash, so a benchmark of `q3-0-6b-hybrid` silently ran against the `docs` collection. The upsert now updates the config with the name. The row was renamed to `q3-0-6b-hybrid`, the experiment was rerun, and the mislabelled benchmark run was deleted. The `docs` Qdrant collection and `data/artifacts/docs/` are now unused and can be deleted. The notebook examples use `q3-0-6b-hybrid` and `q3-0-6b-fixed`.
+- `streamlit` was added to the shared image, so all Dagster services restarted once. After editing a module other than a page script (for example `ui/style.py`), restart the UI with `docker compose restart ui`.
+- Migration `0003` recreates the `experiment_summary` view with `model`, `strategy` and `vector_dimension` columns.
+
+Decided (2026-10-02): the document is `aiayn.pdf`; I draft the query set and you review it; the UI is one Streamlit app with two pages, run as a Docker service; the design should look polished (see 7.3).
+
+## Ideas
+
+Not planned and not in any phase. Each is built only when you ask for it.
+
+- Reuse one parse across experiments instead of re-parsing for each (copy or point to the parse output, and copy its metrics row).
+- A fixed-dimension axis in the matrix (all models truncated to the same size by Matryoshka) to separate model quality from vector size.
+- Embedding models outside the Qwen3 family.
+- Preset experiment configs in `experiments/*.yaml`, selectable in the launchpad.
+- Reranking stage.
+- Quantisation settings in Qdrant.
+- `--exact` search to measure what HNSW gives up, and hybrid (dense plus BM25) search. See Phase 5.
+- `docling-serve` as a separate container, compared against in-process parsing.
+- A dashboard in Grafana or Metabase pointed at Postgres, in place of or beside Streamlit.
+- Marking hits as expected directly in the query page and writing them to `eval/queries.yaml`.
 
 ## Deferred
 
@@ -242,5 +421,7 @@ Done when: two experiments (for example table mode fast versus accurate, or two 
 | Sentence splitting is language-dependent, which affects `semantic` and `recursive` | The sentence splitter is a config value; check it against the language of the actual PDFs before trusting results. |
 | Ollama unloads the model between batches | Set `keep_alive` on requests; record `load_duration` so cold starts are visible in metrics. |
 | Changing embedding dimension in an existing collection | Dimension is part of the config hash; a mismatch against the collection raises before any insert. |
+| The 8b embedding model does not fit the Mac's memory, or Ollama swaps models and distorts latency | Check memory in Phase 7.1; the matrix runs model by model so each is loaded once; `model_load_ms` is recorded per experiment. |
+| Models are ranked by similarity scores, which differ in scale between models | The dashboard compares models on recall, MRR and nDCG only; the plan requires a filled-in query set before the comparison run. |
 | Qdrant data corruption from a Windows bind mount | Qdrant storage uses a Docker named volume only. |
 | Wiping the Postgres volume loses metrics history along with Dagster's run history | Both live in one volume; `docker compose down -v` is called out in `CLAUDE.md`. Add a `pg_dump` script if the history starts to matter. |

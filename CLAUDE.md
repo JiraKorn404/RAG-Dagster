@@ -3,7 +3,7 @@
 A lab for experimenting with PDF ingestion (text and tables) into a vector database.
 Docling parses documents, Ollama embeds them, Qdrant stores and searches them, Dagster orchestrates the pipeline, and PostgreSQL keeps the metrics.
 
-**Status: Phases 0 to 4 done.** The Docker stack (Qdrant, Postgres, Dagster) runs. Config, the Ollama embedder, the Qdrant store, the metrics store with migrations and their Dagster resources exist, PDF parsing (a sensor registers PDFs in `data/raw/` as partitions; `parsed_document` parses one with Docling) chunking (the `chunks` asset, five strategies), embedding (`embeddings`) and Qdrant indexing (`qdrant_index`). `ingest_job` runs all four stages for a document partition. Search (CLI and metrics logging) and benchmarking are still planned. `PLAN.md` is the build plan; update this file as phases land so that it describes what is actually in the repo.
+**Status: Phases 0 to 7 done.** The Docker stack (Qdrant, Postgres, Dagster) runs. Config, the Ollama embedder, the Qdrant store, the metrics store with migrations and their Dagster resources exist, PDF parsing (a sensor registers PDFs in `data/raw/` as partitions; `parsed_document` parses one with Docling) chunking (the `chunks` asset, five strategies), embedding (`embeddings`) and Qdrant indexing (`qdrant_index`). `ingest_job` runs all four stages for a document partition. Search (`rag_lab.search`, a CLI that logs to `search_log`) exists, plus `ask()` and `summary()` for notebooks. Benchmarking (`search_benchmark`, `experiment_summary`) is built, plus a matrix runner (`python -m rag_lab.experiments`) that compares 3 embedding models x 5 chunkers, and a Streamlit UI (`ui` service: dashboard and query page). `PLAN.md` is the build plan; update this file as phases land so that it describes what is actually in the repo.
 
 ## Architecture
 
@@ -18,7 +18,8 @@ data/raw/*.pdf -> parse (Docling) -> chunk -> embed (Ollama) -> index (Qdrant) -
 | Dagster webserver, daemon, code location | Docker on this Windows machine | http://localhost:3000 |
 | Qdrant | Docker on this Windows machine | HTTP `6333` (dashboard at `/dashboard`), gRPC `6334` |
 | PostgreSQL | Docker on this Windows machine | `5432`; databases `dagster` (Dagster's own storage) and `rag_metrics` (ours) |
-| Ollama with `qwen3-embedding:0.6b` | MacBook, reached over Tailscale | `http://<mac-tailscale-ip>:11434` |
+| Ollama with `qwen3-embedding` `0.6b`, `4b`, `8b` | wherever `OLLAMA_BASE_URL` points: this machine (`host.docker.internal:11434`) at the time of Phase 7; earlier the MacBook over Tailscale | `OLLAMA_BASE_URL` |
+| Streamlit UI (dashboard, query page) | Docker on this Windows machine | http://localhost:8501 |
 
 Docling runs in-process inside the Dagster code-location container. This machine has no NVIDIA GPU, so everything local is CPU-only.
 
@@ -72,7 +73,15 @@ This project is kept minimal. Prefer the smallest change that works, and do not 
 - The Postgres init script that creates `rag_metrics` only runs when the data volume is first created. Schema changes go through new numbered files in `src/rag_lab/metrics/migrations/`, never by editing an applied one.
 - `sqlalchemy<2.1` is pinned: SQLAlchemy 2.1 switches the default Postgres driver to psycopg 3, which breaks dagster-postgres.
 - Running tests without a local `uv`: `docker compose run --rm --no-deps -e UV_NO_CACHE=1 -v ./tests:/app/tests dagster-code sh -c "uv pip install --system -q pytest && python -m pytest /app/tests -q"`. In Git Bash prefix it with `MSYS_NO_PATHCONV=1`.
-- Retrieval quality metrics need expected results in `eval/queries.yaml`. Until those are filled in, the benchmark records latency and scores only and leaves quality metrics null.
+- The search CLI loads an experiment's settings from the newest `rag_metrics.experiments` row with that name (written by `parsed_document` and `chunks`), so it only works for experiments that have been ingested at least that far.
+- `rag_lab.search.quick.ask(query, experiment, top_k, modality, log)` and `summary(names)` are the notebook entry points (`summary` shows the `experiment_summary` view). It runs on the host (not in a container), reads `.env`, maps `host.docker.internal` to `localhost` for Ollama, and reaches Postgres and Qdrant at `127.0.0.1` (`localhost` hangs on IPv6).
+- Retrieval quality metrics need expected results in `eval/queries.yaml` (`{source_file, contains}`, `{source_file, page}` or `{chunk_id}` items; `contains` is a case- and whitespace-insensitive snippet of the hit's text and is the right judge when comparing chunkers, because pages and chunk ids differ between them). Until those are filled in, the benchmark records latency and scores only and leaves quality metrics null. The query set version is a hash of the file.
+- Benchmark: materialise `search_benchmark` with `resources.experiment.config.name` (optional `ops.search_benchmark.config`: `top_k`, `repeats`, `queries_file`). It reads the experiment's settings from the `experiments` table like the search CLI, not from the run config. `SELECT * FROM experiment_summary` (a view) compares experiments; `experiment_summary` is the asset that shows it in the UI. A Dagster asset only gets run config through a parameter named `config`.
+
+- Matrix run: `experiments/matrix.yaml` lists models (label to Ollama model), strategies, shared settings and documents; experiments are named `<label>-<strategy>` (`q3-4b-fixed`). Run it inside `dagster-code`: `docker compose exec -d dagster-code sh -c "python -m rag_lab.experiments run experiments/matrix.yaml > data/matrix.log 2>&1"` (`--dry-run` lists the experiments, `--only 'q3-4b-*'` selects some, `--force` redoes finished ones). It calls `dagster.materialize`, so every run is in the Dagster UI. An experiment is skipped when its collection already holds the document and a benchmark on the current query set is finished.
+- Two experiment names with identical settings share a config hash, so the `experiments` row keeps only the last name (and config). The old `docs` experiment became `q3-0-6b-hybrid` this way; its `docs` collection is now unused.
+- Models are compared on quality metrics (nDCG, recall, MRR) and ranks only. Similarity scores are on a different scale for each model.
+- The `ui` service uses the shared image (`streamlit` is a dependency, so adding it needed `docker compose up -d --build`), runs from `/app/ui` so it finds `ui/.streamlit/config.toml`, and bind-mounts `./src` and `./ui`. After editing a module other than the page scripts (for example `ui/style.py`), restart it: `docker compose restart ui`. Colours follow the dataviz palette validated for a dark surface (`ui/style.py`).
 
 ## Layout (planned)
 
@@ -90,25 +99,33 @@ src/rag_lab/
   chunking/                  # segment.py, sectioned.py, one module per strategy, base.py registry, tokens.py
   embedding/                 # ollama.py (embedder), vectors.py, cache.py (on-disk embedding cache)
   storage/                   # Qdrant collection setup and upsert
-  search/                    # vector search + CLI
-  metrics/                   # timing, latency stats, retrieval metrics, Postgres store,
+  search/                    # engine.py (search()), __main__.py (CLI), quick.py (ask() and summary() for notebooks)
+  experiments/               # matrix.py (expands matrix.yaml), __main__.py (the runner)
+  benchmark/                 # queries.py (loads eval/queries.yaml), runner.py (run_benchmark)
+  metrics/                   # timing, latency stats, retrieval.py (quality formulas), summary.py (summary table), Postgres store,
                              # migrations/*.sql (numbered; applied at start-up by MetricsStoreResource)
   assets/                    # Dagster assets, jobs, sensors
+notebook/                    # search.ipynb: try queries with `ask(query, experiment)`; kernel = host .venv
 data/raw/                    # drop PDFs here (git-ignored)
 data/artifacts/              # per-stage outputs (git-ignored)
-eval/queries.yaml            # query set; expected results to be filled in later
+eval/queries.yaml            # query set for the benchmark (30 queries on aiayn.pdf with expected results)
+experiments/matrix.yaml      # models x strategies for the comparison run
+ui/                          # Streamlit app: app.py, dashboard.py, query.py, charts.py, data.py, style.py, .streamlit/config.toml
 tests/                       # a few pure-logic tests only (see "Working style")
 ```
 
 ## Commands (planned)
 
 ```powershell
+docker compose exec dagster-code python -m rag_lab.experiments run experiments/matrix.yaml --dry-run   # list the 15 experiments
+# the UI is at http://localhost:8501 (docker compose up -d)
 docker compose up -d --build          # start the stack
 docker compose logs -f dagster-code   # code location logs
 docker compose down                   # stop; add -v to wipe Qdrant and Postgres volumes
 docker compose exec postgres psql -U <user> -d rag_metrics   # inspect metrics
 uv run pytest                         # the few pure-logic tests; no containers needed
-uv run python -m rag_lab.search "query text" --experiment <name> --top-k 5
+uv run python -m rag_lab.search "query text" --experiment <name> --top-k 5   # needs OLLAMA_BASE_URL, QDRANT_URL, METRICS_DATABASE_URL
+docker compose exec dagster-code python -m rag_lab.search "query text" --experiment <name>   # env already set
 ```
 
 ## Conventions

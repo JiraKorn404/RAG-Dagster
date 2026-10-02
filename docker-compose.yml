@@ -44,6 +44,8 @@ services:
     volumes:
       - ./src:/app/src
       - ./data:/app/data
+      - ./eval:/app/eval
+      - ./experiments:/app/experiments
       # Docling model downloads (Hugging Face + Docling's own cache) land here, not in the image.
       - model_cache:/root/.cache
       - dagster_storage:/opt/dagster/storage
@@ -76,6 +78,25 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      dagster-code:
+        condition: service_started
+
+  # Dashboard over rag_metrics and a page for trying queries across experiments.
+  ui:
+    image: rag-lab-dagster:latest
+    command: streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+    working_dir: /app/ui # so Streamlit finds ui/.streamlit/config.toml
+    environment: *dagster-env
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./src:/app/src
+      - ./ui:/app/ui
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
       dagster-code:
         condition: service_started
 

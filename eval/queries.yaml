@@ -1,0 +1,148 @@
+# Query set for the search benchmark. Each entry:
+#   id        unique name
+#   query     the question
+#   modality  optional: text | table. Restricts the search to that modality and also splits the
+#             quality metrics by it.
+#   expected  optional list of what a good answer points to. Items are {source_file, contains},
+#             {source_file, page} or {chunk_id}. `contains` is a snippet that must appear in the hit's
+#             text (case and whitespace ignored); it is the right judge when experiments chunk the
+#             document differently, because pages and chunk ids differ between chunkers. Leave
+#             `expected` empty and quality metrics are stored as null.
+# The query set's version is a hash of this file, so editing it creates a new version.
+#
+# Draft for aiayn.pdf ("Attention Is All You Need"): 20 text queries, then 10 table queries.
+# Review the questions and snippets before trusting a comparison built on them.
+
+# --- text ---
+- id: encoder-layers
+  query: How many identical layers make up the encoder stack?
+  expected:
+    - {source_file: aiayn.pdf, contains: "The encoder is composed of a stack of N = 6 identical layers"}
+- id: model-dimension
+  query: What output dimension do all sub-layers and the embedding layers produce?
+  expected:
+    - {source_file: aiayn.pdf, contains: "produce outputs of dimension dmodel = 512"}
+- id: decoder-masking
+  query: How does the decoder stop positions from attending to later positions?
+  expected:
+    - {source_file: aiayn.pdf, contains: "prevent positions from attending to subsequent positions"}
+- id: dot-product-scaling
+  query: Why are the dot products divided by the square root of the key dimension?
+  expected:
+    - {source_file: aiayn.pdf, contains: "pushing the softmax function into regions where it has extremely small gradients"}
+- id: additive-vs-dot-product
+  query: How does dot-product attention compare with additive attention in speed and memory?
+  expected:
+    - {source_file: aiayn.pdf, contains: "dot-product attention is much faster and more space-efficient in practice"}
+- id: multi-head
+  query: How does multi-head attention work?
+  expected:
+    - {source_file: aiayn.pdf, contains: "linearly project the queries, keys and values h times"}
+- id: head-count
+  query: How many attention heads does the base model use, and what is the size of each head?
+  expected:
+    - {source_file: aiayn.pdf, contains: "we employ h = 8 parallel attention layers"}
+- id: three-uses
+  query: In which three ways does the Transformer use multi-head attention?
+  expected:
+    - {source_file: aiayn.pdf, contains: "uses multi-head attention in three different ways"}
+- id: encoder-decoder-attention
+  query: Where do the queries, keys and values come from in encoder-decoder attention?
+  expected:
+    - {source_file: aiayn.pdf, contains: "the queries come from the previous decoder layer"}
+- id: feed-forward-size
+  query: What is the inner-layer size of the position-wise feed-forward network?
+  expected:
+    - {source_file: aiayn.pdf, contains: "the inner-layer has dimensionality dff = 2048"}
+- id: positional-order
+  query: How does the model know the order of the tokens when it has no recurrence or convolution?
+  expected:
+    - {source_file: aiayn.pdf, contains: "to the input embeddings at the bottoms of the encoder and decoder stacks"}
+- id: sinusoid-choice
+  query: Why were sinusoidal positional encodings chosen over learned ones?
+  expected:
+    - {source_file: aiayn.pdf, contains: "extrapolate to sequence lengths longer than the ones encountered during training"}
+- id: why-self-attention
+  query: What three requirements motivate the use of self-attention?
+  expected:
+    - {source_file: aiayn.pdf, contains: "we consider three desiderata"}
+- id: training-data
+  query: Which dataset and how many sentence pairs were used to train the English-German model?
+  expected:
+    - {source_file: aiayn.pdf, contains: "about 4.5 million sentence pairs"}
+- id: hardware
+  query: What hardware were the models trained on?
+  expected:
+    - {source_file: aiayn.pdf, contains: "one machine with 8 NVIDIA P100 GPUs"}
+- id: optimizer
+  query: Which optimizer was used for training?
+  expected:
+    - {source_file: aiayn.pdf, contains: "We used the Adam optimizer"}
+- id: label-smoothing
+  query: What does label smoothing do to perplexity and to accuracy?
+  expected:
+    - {source_file: aiayn.pdf, contains: "This hurts perplexity, as the model learns to be more unsure"}
+- id: residual-dropout
+  query: Where is dropout applied and what rate does the base model use?
+  expected:
+    - {source_file: aiayn.pdf, contains: "we use a rate of Pdrop = 0.1"}
+- id: beam-search
+  query: What beam size and length penalty were used at inference time?
+  expected:
+    - {source_file: aiayn.pdf, contains: "beam size of 4 and length penalty"}
+- id: future-work
+  query: What future work do the authors plan?
+  expected:
+    - {source_file: aiayn.pdf, contains: "modalities other than text"}
+
+# --- tables ---
+- id: complexity-self-attention
+  query: What is the complexity per layer and the maximum path length of a self-attention layer?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Self-Attention | O(n2 · d) | O(1) | O(1)"}
+- id: path-length-convolutional
+  query: What is the maximum path length of a convolutional layer?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Convolutional | O(k · n · d2 ) | O(1) | O(logk(n))"}
+- id: bleu-big-model
+  query: What BLEU scores did the big Transformer reach on English-to-German and English-to-French?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Transformer (big) | 28.4 | 41.8"}
+- id: convs2s-cost
+  query: What was the training cost in FLOPs of ConvS2S on English-to-German?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "ConvS2S [9] | 25.16 | 40.46 | 9.6 · 1018"}
+- id: base-model-bleu
+  query: What BLEU scores did the base Transformer reach?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Transformer (base model) | 27.3 | 38.1"}
+- id: best-ensemble
+  query: Which previously published ensemble scored best on English-to-German?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "ConvS2S Ensemble [9] | 26.36 | 41.29"}
+- id: learned-positional
+  query: What changes in the results when sinusoidal positional encoding is replaced by learned embeddings?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "positional embedding instead of sinusoids"}
+- id: big-model-config
+  query: What are the training steps, perplexity, BLEU and parameter count of the big model configuration?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "300K | 4.33 | 26.4 | 213"}
+- id: parsing-semi-supervised
+  query: What F1 score did the Transformer reach on WSJ section 23 in the semi-supervised setting?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Transformer (4 layers) | semi-supervised | 92.7"}
+- id: parsing-generative
+  query: Which parser has the highest F1 score among the generative models?
+  modality: table
+  expected:
+    - {source_file: aiayn.pdf, contains: "Dyer et al. (2016) [8] | generative | 93.3"}

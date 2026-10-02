@@ -13,6 +13,8 @@ dependencies = [
     "httpx",
     "psycopg[binary]",
     "docling",
+    "ipykernel>=7.4.0",
+    "streamlit",
 ]
 
 [dependency-groups]

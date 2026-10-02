@@ -21,9 +21,19 @@ class MetricsStore:
     def upsert_experiment(self, config_hash: str, name: str, config: dict) -> None:
         self._execute(
             """INSERT INTO experiments (config_hash, name, config) VALUES (%s, %s, %s)
-               ON CONFLICT (config_hash) DO UPDATE SET name = EXCLUDED.name""",
+               ON CONFLICT (config_hash) DO UPDATE SET name = EXCLUDED.name, config = EXCLUDED.config""",
             (config_hash, name, Jsonb(config)),
         )
+
+    def get_experiment(self, name: str) -> tuple[str, dict] | None:
+        """(config_hash, config) of the newest config recorded under this experiment name."""
+        with psycopg.connect(self.database_url) as conn:
+            row = conn.execute(
+                "SELECT config_hash, config FROM experiments WHERE name = %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        return (row[0], row[1]) if row else None
 
     def add_stage_metric(
         self,
@@ -108,6 +118,20 @@ class MetricsStore:
             ],
             many=True,
         )
+
+    def has_finished_benchmark(self, config_hash: str, query_set_version: str) -> bool:
+        with psycopg.connect(self.database_url) as conn:
+            return conn.execute(
+                "SELECT 1 FROM benchmark_runs WHERE config_hash = %s AND query_set_version = %s "
+                "AND finished_at IS NOT NULL LIMIT 1",
+                (config_hash, query_set_version),
+            ).fetchone() is not None
+
+    def experiment_summary(self) -> tuple[list[str], list[tuple]]:
+        """Column names and rows of the experiment_summary view."""
+        with psycopg.connect(self.database_url) as conn:
+            cur = conn.execute("SELECT * FROM experiment_summary")
+            return [col.name for col in cur.description], cur.fetchall()
 
     def add_search_log(
         self,

@@ -1,0 +1,30 @@
+[project]
+name = "rag-lab"
+version = "0.1.0"
+description = "Lab for PDF ingestion into Qdrant, orchestrated by Dagster"
+requires-python = ">=3.12"
+dependencies = [
+    "dagster",
+    "dagster-webserver",
+    "dagster-postgres",
+    # SQLAlchemy 2.1 defaults postgresql:// to psycopg 3, which breaks dagster-postgres' NOTIFY.
+    "sqlalchemy<2.1",
+    "qdrant-client",
+    "httpx",
+    "psycopg[binary]",
+    "docling",
+]
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rag_lab"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]

@@ -1,0 +1,86 @@
+x-dagster-env: &dagster-env
+  DAGSTER_HOME: /opt/dagster/dagster_home
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+  DATA_DIR: /app/data
+  QDRANT_URL: http://qdrant:6333
+  METRICS_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rag_metrics
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: dagster
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d dagster"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Named volume only: a Windows bind mount can corrupt Qdrant's data.
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  dagster-code:
+    build:
+      context: .
+      dockerfile: docker/dagster/Dockerfile
+    image: rag-lab-dagster:latest
+    command: dagster api grpc -h 0.0.0.0 -p 4000 -m rag_lab.definitions
+    environment: *dagster-env
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      # Docling model downloads (Hugging Face + Docling's own cache) land here, not in the image.
+      - model_cache:/root/.cache
+      - dagster_storage:/opt/dagster/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  dagster-webserver:
+    image: rag-lab-dagster:latest
+    command: dagster-webserver -h 0.0.0.0 -p 3000 -w /opt/dagster/dagster_home/workspace.yaml
+    environment: *dagster-env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - dagster_storage:/opt/dagster/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dagster-code:
+        condition: service_started
+
+  dagster-daemon:
+    image: rag-lab-dagster:latest
+    command: dagster-daemon run -w /opt/dagster/dagster_home/workspace.yaml
+    environment: *dagster-env
+    volumes:
+      - dagster_storage:/opt/dagster/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dagster-code:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  model_cache:
+  dagster_storage:

@@ -81,6 +81,60 @@ class QdrantStore:
         )
         return response.points
 
+    def documents(self, collection: str) -> list[dict]:
+        """The documents in a collection: for each, its id, number of points, file name and when it was
+        ingested. Counts come from one facet call on the indexed `doc_id`; the name and time from one
+        point of the document. A collection that was not made by this app may have no such index; it is
+        then read by scrolling through its points."""
+        try:
+            hits = self.client.facet(collection, key="doc_id", limit=1000, exact=True).hits
+        except Exception:  # noqa: BLE001  (no payload index on doc_id: count by scrolling instead)
+            return self._documents_by_scrolling(collection)
+        docs = []
+        for hit in hits:
+            condition = Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=hit.value))])
+            points, _ = self.client.scroll(
+                collection, scroll_filter=condition, limit=1, with_payload=["source_file", "ingested_at"]
+            )
+            payload = points[0].payload if points else {}
+            docs.append(
+                {
+                    "doc_id": hit.value,
+                    "points": hit.count,
+                    "source_file": payload.get("source_file"),
+                    "ingested_at": payload.get("ingested_at"),
+                }
+            )
+        return sorted(docs, key=lambda d: (d["source_file"] or "", d["doc_id"]))
+
+    def _documents_by_scrolling(self, collection: str) -> list[dict]:
+        docs: dict[str, dict] = {}
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection, limit=1000, offset=offset, with_payload=["doc_id", "source_file", "ingested_at"]
+            )
+            for point in points:
+                payload = point.payload or {}
+                doc_id = payload.get("doc_id")
+                if doc_id is None:
+                    continue
+                doc = docs.setdefault(
+                    doc_id,
+                    {"doc_id": doc_id, "points": 0, "source_file": payload.get("source_file"), "ingested_at": payload.get("ingested_at")},
+                )
+                doc["points"] += 1
+            if offset is None:
+                break
+        return sorted(docs.values(), key=lambda d: (d["source_file"] or "", d["doc_id"]))
+
+    def count_document(self, collection: str, doc_id: str) -> int:
+        condition = Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))])
+        return self.client.count(collection, count_filter=condition, exact=True).count
+
+    def delete_collection(self, collection: str) -> None:
+        self.client.delete_collection(collection)
+
     def has_document(self, collection: str, doc_id: str) -> bool:
         if not self.client.collection_exists(collection):
             return False

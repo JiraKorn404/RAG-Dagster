@@ -1,0 +1,150 @@
+"""What is in each experiment, with delete buttons for a document and for a whole experiment.
+
+The work is in rag_lab.library; this page lists, asks for confirmation inline, and redraws."""
+
+import os
+
+import data
+import streamlit as st
+import style
+
+from rag_lab.library import delete_document, delete_experiment, list_library
+from rag_lab.metrics.store import MetricsStore
+from rag_lab.storage.qdrant import QdrantStore
+
+
+@st.cache_resource
+def stores() -> tuple[MetricsStore, QdrantStore]:
+    return MetricsStore(os.environ["METRICS_DATABASE_URL"]), QdrantStore(os.environ["QDRANT_URL"])
+
+
+def _title(entry: dict) -> str:
+    config = entry["config"]
+    parts = [entry["name"]]
+    if config:
+        parts += [data.model_label(config["embed"]["model"]), config["chunk"]["strategy"]]
+    parts.append(f"{len(entry['documents'])} document(s)")
+    parts.append(f"{entry['points']} points")
+    flags = []
+    if not entry["has_row"]:
+        flags.append("no experiment row")
+    if not entry["has_collection"]:
+        flags.append("no collection")
+    if entry["in_report"]:
+        flags.append("in a benchmark report")
+    return " · ".join(parts) + (f"  ({', '.join(flags)})" if flags else "")
+
+
+def _ask(kind: str, name: str, doc_id: str | None = None) -> None:
+    st.session_state["confirm_delete"] = {"kind": kind, "name": name, "doc_id": doc_id}
+
+
+def _clear_ask() -> None:
+    st.session_state.pop("confirm_delete", None)
+
+
+def _confirm(entry: dict, pending: dict) -> None:
+    """The inline 'are you sure' for this entry, and the delete itself."""
+    metrics, qdrant = stores()
+    name = entry["name"]
+    if pending["kind"] == "doc":
+        doc = next(d for d in entry["documents"] if d["doc_id"] == pending["doc_id"])
+        label = doc["source_file"] or doc["doc_id"]
+        st.warning(
+            f"Remove “{label}” from “{name}”? This deletes its {doc['points']} points and its files in this "
+            "experiment. The uploaded PDF stays. This cannot be undone."
+        )
+    elif entry["has_row"]:
+        st.warning(
+            f"Delete the experiment “{name}”? This deletes its collection ({entry['points']} points in "
+            f"{len(entry['documents'])} document(s)), its files and its records. This cannot be undone."
+            + (" It belongs to a benchmark report: the report stays, but its numbers were measured with this experiment." if entry["in_report"] else "")
+        )
+    else:
+        st.warning(f"Delete the collection “{name}”? It has no experiment record. This cannot be undone.")
+    yes, no, _ = st.columns([1, 1, 6])
+    if no.button("Cancel", key=f"cancel-{name}"):
+        _clear_ask()
+        st.rerun()
+    if yes.button("Delete", type="primary", key=f"yes-{name}"):
+        try:
+            if pending["kind"] == "doc":
+                done = delete_document(name, pending["doc_id"], metrics, qdrant)
+                message = (
+                    f"Removed “{label}” from “{name}”: {done['points']} points, {done['files']} files, "
+                    f"{done['rows']} metric rows."
+                )
+            else:
+                done = delete_experiment(name, metrics, qdrant)
+                message = (
+                    f"Deleted “{name}”: collection {'yes' if done['collection'] else 'was missing'}, "
+                    f"folder {'yes' if done['folder'] else 'was missing'}, record {'yes' if done['row'] else 'was missing'}."
+                )
+        except Exception as e:  # noqa: BLE001  (Qdrant or Postgres not reachable: show it, change nothing else)
+            st.error(f"The delete failed: {e}. Nothing after the failed step was changed; press Delete again to retry.")
+            return
+        _clear_ask()
+        st.cache_data.clear()  # "Try a query" caches its experiment list
+        st.session_state["experiments_message"] = message
+        st.rerun()
+
+
+def _render(entry: dict, pending: dict | None) -> None:
+    name = entry["name"]
+    mine = pending is not None and pending["name"] == name
+    with st.expander(_title(entry), expanded=mine):
+        if entry["created_at"]:
+            st.caption(f"Created {entry['created_at']:%Y-%m-%d %H:%M}")
+        if not entry["has_collection"]:
+            st.caption("This experiment has no Qdrant collection, so it cannot be searched.")
+        for doc in entry["documents"]:
+            name_col, id_col, points_col, when_col, button_col = st.columns([4, 2, 1, 2, 1])
+            name_col.markdown(f"**{doc['source_file'] or 'unknown file'}**")
+            id_col.code(doc["doc_id"], language=None)
+            points_col.caption(f"{doc['points']} points")
+            when_col.caption((doc["ingested_at"] or "")[:16].replace("T", " "))
+            button_col.button("Delete", key=f"doc-{name}-{doc['doc_id']}", on_click=_ask, args=("doc", name, doc["doc_id"]))
+        if entry["has_collection"] and not entry["documents"]:
+            st.caption("The collection holds no documents.")
+        st.button(
+            "Delete experiment" if entry["has_row"] else "Delete collection",
+            key=f"exp-{name}",
+            on_click=_ask,
+            args=("exp", name),
+        )
+        if mine:
+            _confirm(entry, pending)
+
+
+style.hero("Experiments", "What is in each experiment, and delete what you no longer need")
+
+metrics, qdrant = stores()
+message = st.session_state.pop("experiments_message", None)
+if message:
+    st.success(message)
+
+entries = list_library(metrics, qdrant)
+if not entries:
+    st.info("No experiments yet. Upload a document or run a benchmark.")
+    st.stop()
+
+with_row = [e for e in entries if e["has_row"]]
+without_row = [e for e in entries if not e["has_row"]]
+total_docs = sum(len(e["documents"]) for e in entries)
+st.caption(
+    f"{len(with_row)} experiment(s), {total_docs} document(s) and {sum(e['points'] for e in entries)} points in "
+    f"Qdrant." + (f" {len(without_row)} collection(s) have no experiment record." if without_row else "")
+)
+if st.button("Refresh"):
+    st.rerun()
+
+pending = st.session_state.get("confirm_delete")
+if pending and not any(e["name"] == pending["name"] for e in entries):
+    _clear_ask()  # what was being deleted is already gone
+    pending = None
+for entry in with_row:
+    _render(entry, pending)
+if without_row:
+    style.section("Collections without an experiment record", "Leftovers in Qdrant that nothing in the app knows about.")
+    for entry in without_row:
+        _render(entry, pending)

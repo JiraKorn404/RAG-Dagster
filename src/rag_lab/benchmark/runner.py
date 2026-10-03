@@ -8,7 +8,6 @@ closed browser tab.
 """
 
 import re
-import shutil
 import time
 import traceback
 import uuid
@@ -24,10 +23,10 @@ from rag_lab.chunking.segment import reference_text, segment
 from rag_lab.config import ChunkConfig, EmbedConfig, ExperimentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.ingest import clean_experiment_name, ingest_document
+from rag_lab.library import delete_experiment
 from rag_lab.metrics.retrieval import query_metrics, relevance
 from rag_lab.metrics.stats import latency_summary
 from rag_lab.metrics.store import MetricsStore
-from rag_lab.paths import DATA_DIR
 from rag_lab.search import search
 from rag_lab.storage.qdrant import QdrantStore
 
@@ -335,11 +334,6 @@ def delete_report_experiments(report_id: str, metrics: MetricsStore, qdrant: Qdr
     its numbers stay. Returns the names removed."""
     removed = []
     for result in metrics.get_results(report_id):
-        name = result["experiment"]
-        if qdrant.client.collection_exists(name):
-            qdrant.client.delete_collection(name)
-        shutil.rmtree(DATA_DIR / "artifacts" / name, ignore_errors=True)
-        metrics.delete_experiment(name)
-        removed.append(name)
+        delete_experiment(result["experiment"], metrics, qdrant)
+        removed.append(result["experiment"])
     return removed
-

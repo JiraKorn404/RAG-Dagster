@@ -126,6 +126,22 @@ button[data-baseweb="tab"] {{ font-weight: 600; }}
 """
 
 
+def palette() -> dict:
+    """The colours the Altair charts use (ui/charts.py reads this rather than the constants above, so
+    the chart colours can be changed in one place)."""
+    return {
+        "surface": SURFACE,
+        "grid": GRID,
+        "baseline": BASELINE,
+        "ink_2": INK_2,
+        "muted": MUTED,
+        "models": MODEL_COLORS,
+        "ramp": RAMP,
+        "text_on_high": "#0b0b0b",  # value labels on the bright end of the heatmap ramp
+        "text_on_low": "#ffffff",
+    }
+
+
 def inject() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 

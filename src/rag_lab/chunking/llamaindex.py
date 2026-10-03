@@ -10,7 +10,7 @@ Each text section becomes a Document whose one embed-visible metadata value is i
 splitters reserve room for them and `node.get_content(MetadataMode.EMBED)` is "headings, newline,
 body", as in the native engine. Tables never go through a splitter.
 
-What differs from the native engine (see PLAN.md, Phase 8): `recursive.separators`, the `stddev` and
+What differs from the native engine (see COMPLETED_PLAN.md, Phase 8): `recursive.separators`, the `stddev` and
 `absolute` breakpoint types and `semantic.min_tokens` do not exist here; the semantic threshold is
 taken per section, not per document; token windows of `fixed` break on word boundaries.
 """

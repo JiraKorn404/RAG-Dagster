@@ -63,13 +63,29 @@ class MetricsStore:
                           (SELECT count(DISTINCT m.doc_id) FROM ingestion_stage_metrics m
                            WHERE m.config_hash = e.config_hash) AS documents,
                           EXISTS (SELECT 1 FROM benchmark_results r
-                                  WHERE r.experiment = e.name) AS benchmarked
+                                  WHERE r.experiment = e.name) AS benchmarked,
+                          e.created_at
                    FROM experiments e ORDER BY e.name, e.created_at DESC"""
             ).fetchall()
         return [
-            {"name": r[0], "config_hash": r[1], "config": r[2], "documents": r[3], "benchmarked": r[4]}
+            {
+                "name": r[0],
+                "config_hash": r[1],
+                "config": r[2],
+                "documents": r[3],
+                "benchmarked": r[4],
+                "created_at": r[5],
+            }
             for r in rows
         ]
+
+    def delete_document_rows(self, config_hash: str, doc_id: str) -> int:
+        """Remove one document's stage metric rows in one experiment. Returns how many rows went."""
+        with psycopg.connect(self.database_url) as conn:
+            return conn.execute(
+                "DELETE FROM ingestion_stage_metrics WHERE config_hash = %s AND doc_id = %s",
+                (config_hash, doc_id),
+            ).rowcount
 
     def add_search_log(
         self,

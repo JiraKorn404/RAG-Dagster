@@ -9,7 +9,6 @@ from qdrant_client.models import (
     HnswConfigDiff,
     MatchValue,
     PayloadSchemaType,
-    PointStruct,
     ScoredPoint,
     SearchParams,
     VectorParams,
@@ -46,27 +45,6 @@ class QdrantStore:
         )
         for field in PAYLOAD_INDEXES:
             self.client.create_payload_index(name, field, PayloadSchemaType.KEYWORD)
-
-    def upsert(
-        self,
-        collection: str,
-        ids: list[str],
-        vectors: list[list[float]],
-        payloads: list[dict],
-        batch_size: int = 256,
-    ) -> int:
-        """`ids` are already point ids (see to_point_id). Waits for each batch so timings are honest."""
-        for i in range(0, len(ids), batch_size):
-            points = [
-                PointStruct(id=pid, vector=vec, payload=pay)
-                for pid, vec, pay in zip(
-                    ids[i : i + batch_size],
-                    vectors[i : i + batch_size],
-                    payloads[i : i + batch_size],
-                )
-            ]
-            self.client.upsert(collection, points, wait=True)
-        return len(ids)
 
     def delete_document(self, collection: str, doc_id: str) -> None:
         self.client.delete(

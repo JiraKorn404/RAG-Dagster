@@ -1,16 +1,17 @@
 # RAG-Dagster
 
-A lab for experimenting with PDF ingestion (text and tables) into a vector database.
-Docling parses documents, Ollama embeds them, Qdrant stores and searches them, Dagster orchestrates the pipeline, and PostgreSQL keeps the metrics.
+A RAG platform for PDF documents (text and tables): upload a document, choose how it is chunked, embed it into a vector database, and search it. A benchmark page compares embedding models and chunking strategies on one document and produces a PDF report.
+Docling parses documents (read through LlamaIndex's `DoclingReader`), LlamaIndex splits them, Ollama embeds them, Qdrant stores and searches them (written through LlamaIndex's `QdrantVectorStore`), Streamlit is the UI, Dagster orchestrates the same pipeline for batch ingestion, and PostgreSQL keeps the metrics.
 
-**Status: Phases 0 to 7 done.** The Docker stack (Qdrant, Postgres, Dagster) runs. Config, the Ollama embedder, the Qdrant store, the metrics store with migrations and their Dagster resources exist, PDF parsing (a sensor registers PDFs in `data/raw/` as partitions; `parsed_document` parses one with Docling) chunking (the `chunks` asset, five strategies), embedding (`embeddings`) and Qdrant indexing (`qdrant_index`). `ingest_job` runs all four stages for a document partition. Search (`rag_lab.search`, a CLI that logs to `search_log`) exists, plus `ask()` and `summary()` for notebooks. Benchmarking (`search_benchmark`, `experiment_summary`) is built, plus a matrix runner (`python -m rag_lab.experiments`) that compares 3 embedding models x 5 chunkers, and a Streamlit UI (`ui` service: dashboard and query page). `PLAN.md` is the build plan; update this file as phases land so that it describes what is actually in the repo.
+**Status: Phases 0 to 11 done.** The Docker stack (Qdrant, Postgres, Dagster, the Streamlit UI) runs. The UI has three pages: **Upload** (upload a PDF, pick a chunking strategy and its settings, see where the cuts fall in the document, embed it into a new or existing experiment), **Try a query** (pick an experiment, set top k, search) and **Benchmark** (one document, every chosen embedding model x chunking strategy, a saved report with a PDF download). A sensor registers PDFs in `data/raw/` as Dagster partitions and `ingest_job` runs parse, chunk, embed and index for one. `PLAN.md` is the build plan and its history (Phases 6, 6a, 7 and 8 describe a benchmark dashboard, matrix runner and query set that Phase 11 removed); update this file as phases land so that it describes what is actually in the repo.
 
 ## Architecture
 
 ```
-data/raw/*.pdf -> parse (Docling) -> chunk -> embed (Ollama) -> index (Qdrant) -> search + benchmark
-                                                                                          |
-                                                                          metrics -> PostgreSQL (rag_metrics)
+upload / data/raw/*.pdf -> parse (Docling) -> chunk -> embed (Ollama) -> index (Qdrant) -> search
+                                                                                |
+                                                          metrics -> PostgreSQL (rag_metrics)
+Benchmark page: one document -> an experiment per model x strategy -> probe and test queries -> report (+ PDF)
 ```
 
 | Component | Where it runs | Address |
@@ -18,10 +19,10 @@ data/raw/*.pdf -> parse (Docling) -> chunk -> embed (Ollama) -> index (Qdrant) -
 | Dagster webserver, daemon, code location | Docker on this Windows machine | http://localhost:3000 |
 | Qdrant | Docker on this Windows machine | HTTP `6333` (dashboard at `/dashboard`), gRPC `6334` |
 | PostgreSQL | Docker on this Windows machine | `5432`; databases `dagster` (Dagster's own storage) and `rag_metrics` (ours) |
-| Ollama with `qwen3-embedding` `0.6b`, `4b`, `8b` | wherever `OLLAMA_BASE_URL` points: this machine (`host.docker.internal:11434`) at the time of Phase 7; earlier the MacBook over Tailscale | `OLLAMA_BASE_URL` |
-| Streamlit UI (dashboard, query page) | Docker on this Windows machine | http://localhost:8501 |
+| Ollama with `qwen3-embedding` `0.6b`, `4b`, `8b` | wherever `OLLAMA_BASE_URL` points: this machine (`host.docker.internal:11434`) | `OLLAMA_BASE_URL` |
+| Streamlit UI (Upload, Try a query, Benchmark) | Docker on this Windows machine | http://localhost:8501 |
 
-Docling runs in-process inside the Dagster code-location container. This machine has no NVIDIA GPU, so everything local is CPU-only.
+Docling runs in-process inside the Dagster code-location container and inside the UI container (Upload and Benchmark parse there). This machine has no NVIDIA GPU, so everything local is CPU-only.
 
 ## Scope
 
@@ -39,11 +40,11 @@ This project is kept minimal. Prefer the smallest change that works, and do not 
 
 ## Design rules
 
-- **This is a lab.** Every stage choice (Docling options, chunker, embedding dimension, distance metric) is a config value, never a constant. A new experiment is a new config, not a code edit.
-- **Stages are modular.** Parsing, chunking, embedding, storage and search live in separate packages under `src/rag_lab/` as plain Python with no Dagster imports. Dagster assets in `assets/` are thin wrappers that call them. Search must be usable without Dagster running.
+- **Every stage choice is a config value**, never a constant (Docling options, chunker, embedding dimension, distance metric). A new experiment is a new config, not a code edit.
+- **Stages are modular.** Parsing, chunking, embedding, storage, search and the benchmark live in separate packages under `src/rag_lab/` as plain Python with no Dagster or Streamlit imports. Dagster assets in `assets/` and the pages in `ui/` are thin callers. Search must be usable without Dagster running.
 - **One Qdrant collection per experiment.** The collection name comes from the experiment name, so runs with different settings never mix vectors. Each chunk also stores the config hash that produced it.
 - **Vectors are supplied by us.** Qdrant only stores and searches vectors; embeddings come from the Ollama resource. Do not use the Qdrant client's built-in FastEmbed helpers for dense vectors.
-- **Metrics go to PostgreSQL.** Ingestion, search and benchmark metrics are written to the `rag_metrics` database, keyed by experiment and config hash. Dagster asset metadata shows a summary of the same numbers; Postgres is the source of truth for comparisons.
+- **Metrics go to PostgreSQL.** Ingestion stage metrics, the search log and benchmark reports are written to the `rag_metrics` database. Dagster asset metadata shows a summary of the ingestion numbers; Postgres is the source of truth.
 - **Never write to the `dagster` database.** It belongs to Dagster. Our tables live only in `rag_metrics`.
 - **Intermediates are kept on disk** under `data/artifacts/<experiment>/<stage>/` so that a stage can be re-run without redoing the ones before it.
 
@@ -52,38 +53,41 @@ This project is kept minimal. Prefer the smallest change that works, and do not 
 - `qwen3-embedding:0.6b` outputs 1024-dimension vectors and supports smaller dimensions through Matryoshka truncation. Vectors must be L2-normalised again after truncation.
 - Qwen3 embedding is asymmetric: **queries** get an instruction prefix (`Instruct: <task>\nQuery: <text>`), **documents** are embedded as-is. Mixing these up silently lowers retrieval quality.
 - Tables are embedded as text (Markdown serialisation). Each chunk carries a `modality` of `text` or `table`.
-- Chunking strategies are `hybrid`, `hierarchical`, `fixed`, `recursive` and `semantic`, registered with `@register("name")` in `chunking/`. `fixed`, `recursive` and `semantic` split text only and handle tables themselves by `table_handling`; `hybrid` and `hierarchical` are Docling's chunkers (Markdown table serialiser, `row-wise` unsupported). `overlap` applies to `fixed` only.
-- `semantic` chunking calls Ollama for sentence embeddings (document mode, no query prefix), so it is the only chunk strategy that needs the Mac. Limits are measured in tokens with the Qwen3 tokenizer, not characters.
+- Chunking strategies are `hybrid`, `hierarchical`, `fixed`, `recursive` and `semantic`. `fixed`, `recursive` and `semantic` split text only and handle tables themselves by `table_handling`; `hybrid` and `hierarchical` are Docling's chunkers (Markdown table serialiser, `row-wise` unsupported). `overlap` applies to `fixed` only.
+- `chunk.engine` is `llamaindex` (the default; `chunking/llamaindex.py`: `DoclingNodeParser`, `TokenTextSplitter`, `SentenceSplitter`, `SemanticSplitterNodeParser`) or `native` (our own splitters in `chunking/`, kept). `native` is left out of the config hash, so hashes of experiments made before the engine existed are unchanged, but a config that does not set `engine` is `llamaindex`. The `llamaindex` engine rejects `recursive.separators` and `semantic.breakpoint_type` other than `percentile`, ignores `semantic.min_tokens`, and takes the semantic threshold per section. `hybrid`, `hierarchical` and `recursive` give the same chunks as `native`; `fixed` and `semantic` do not (`semantic` made smaller chunks and scored lower on the one paper it was compared on).
+- Embedding stays on our `OllamaEmbedder`; LlamaIndex only sees it through `embedding/llamaindex.py`, which the semantic splitter uses. LlamaIndex's sentence splitter downloads NLTK data on first use into `NLTK_DATA` (`/root/.cache/nltk_data`, the `model_cache` volume).
+- `qdrant_index` writes with `QdrantVectorStore` into a collection that `QdrantStore.ensure_collection` created (unnamed vector, HNSW settings, payload indexes). The payload has the usual fields plus LlamaIndex's `_node_content`, `ref_doc_id` and `document_id`. Two runs of the same text can give embeddings that differ in the third decimal (Ollama), enough to move recall@5 by one query.
+- `rag_lab/ingest.py` holds what the Dagster assets, the Upload page and the benchmark share: `save_upload`, `ensure_parsed`, `ingest_document` (parse and chunk files, experiment row, metric rows, embed, index), `embed_chunks`, `index_chunks`, `record_parse`, `record_chunk`, `register_experiment`, `check_new_experiment_name`, `experiments_with_settings`. The assets are wrappers.
+- Uploads go to `data/uploads/<doc_id>/`, not `data/raw` (the sensor would register them), and are parsed once with default settings into `data/artifacts/_uploads/<doc_id>/`. The `ui` container mounts `./data` and `model_cache`.
+- A document's id is the first 16 hex characters of the SHA-256 of its bytes; it is also the Dagster partition key. Renaming a PDF does not re-ingest it.
+- Config identity: `ExperimentConfig.config_hash()` covers the settings and the optional `tag` (empty is left out, so older hashes are unchanged); `settings_hash()` ignores name and tag. The `experiments` row is keyed by `config_hash`, so two untagged experiments with identical settings share a row and the last name wins. The Upload page and the benchmark tag every experiment they create with its name, so each has its own hash. A Dagster run config for a tagged experiment must include `resources.experiment.config.tag` (the same value), or the assets would write under the untagged hash; the search CLI reads the stored settings by name and needs nothing.
+- On Upload, an experiment can be a new one (any unused name) or an existing one with the same `settings_hash()`; several documents can share an experiment. An experiment that belongs to a benchmark report needs a confirmation before a document is added, and its report is not redone.
+- Every `Chunk` has a `span` (`[start, end]` in `segment.reference_text(blocks)`, the document read in order) and `span_approx` (true for a split table or a paragraph Docling split); an empty span means no source text (an undecoded formula). The section strategies record exact spans; `chunking/spans.py` places the Docling chunkers' chunks by the `self_ref` of their items. Spans are only in `.chunks.jsonl`, not in the Qdrant payload.
+- Benchmark (`rag_lab/benchmark/`): `runner.py` runs a report in a background thread of the UI process (one at a time), model by model, and saves each experiment's result to `benchmark_results` as it finishes; the report row (`benchmark_reports`) is heartbeated, and a `running` report whose `updated_at` is older than 15 minutes shows as `interrupted`. `report.py` builds the report as plain data that the page and `pdf.py` (reportlab, standard fonts, so Latin-1 only) both draw. Experiments are named `bench-<document>-<report id>-<model>-<strategy>`, tagged with their name, kept and searchable; a button deletes a report's experiments but keeps the report.
+- Benchmark measurements: **probe queries** (sentences sampled evenly from the document, the same for every experiment) give latency and similarity spread, never quality. **Test queries** (a query plus a snippet that must appear in the right chunk, judged by `metrics/retrieval.py`) give hit rate, recall, precision, MRR, MAP and nDCG at 1, 3, 5, 10 up to top k, and **snippet coverage**: the share of snippets that appear whole inside some chunk, which caps what a chunker can score. Models are compared on speed and, with test queries, quality only: similarity scores are on a different scale for each model.
+- `semantic` chunking calls Ollama for sentence embeddings (document mode, no query prefix). Limits are measured in tokens with the Qwen3 tokenizer, not characters. Semantic chunking caches sentence-group embeddings in `data/artifacts/_cache/embeddings/`, shared across experiments.
+- Chunk sizes are counted with the Qwen3 Hugging Face tokenizer (`EmbedConfig.tokenizer`), cached in the `model_cache` volume. Headings are embedded with each chunk and use part of `max_tokens`.
 - Use Ollama's `/api/embed` endpoint (batch input), not the older `/api/embeddings`.
 - The Python client is `qdrant-client`. Search goes through `query_points`.
 - With the cosine metric, Qdrant's `score` is the cosine similarity itself (higher is better). Report `similarity = score` and `distance = 1 - score`.
 - Qdrant point IDs must be unsigned integers or UUIDs. Chunk IDs are turned into deterministic UUIDs (uuid5) so re-ingestion overwrites instead of duplicating.
 - Filtering on a payload field (`doc_id`, `modality`, `source_file`) needs a payload index on that field; create them when the collection is created.
 - Qdrant storage must be a Docker named volume. A bind mount to the Windows filesystem can corrupt its data.
-- Containers reach the Mac by Tailscale IP. MagicDNS names may not resolve inside containers, so `OLLAMA_BASE_URL` uses the `100.x.y.z` address.
-- Ollama on the Mac must listen on all interfaces (`OLLAMA_HOST=0.0.0.0`), otherwise it only answers on localhost.
-- A document's id is the first 16 hex characters of the SHA-256 of its bytes; it is also the Dagster partition key. Renaming a PDF does not re-ingest it.
-- The code container takes about 50 s to start because it imports Docling. Reload the code location in the UI if it shows "could not reach user code server" right after `docker compose up`.
+- Ollama must be reachable from the containers at `OLLAMA_BASE_URL` (on a remote machine it must listen on all interfaces, `OLLAMA_HOST=0.0.0.0`; MagicDNS names may not resolve inside containers, so use the Tailscale IP).
+- The code container takes about 50 s to start because it imports Docling. Reload the code location in the Dagster UI if it shows "could not reach user code server" right after `docker compose up`.
 - The `model_cache` volume (mounted at `/root/.cache`) holds Docling's models. Ad hoc `uv pip install` in that container needs `UV_NO_CACHE=1`, or uv's cache (GBs) lands there too.
-- Run config is set once per run on the shared `experiment` resource, not per asset: launchpad key `resources.experiment.config` with `name` (required) and optional `parse`, `chunk`, `embed`, `index` sections. Assets read it with `experiment.config()`. Over GraphQL: `{"resources": {"experiment": {"config": {...}}}}`.
-- Ingest end to end: launch `ingest_job` for a partition with `resources.experiment.config` set. Changing `embed.dimension` needs a new experiment name, because a collection's vector size is fixed.
+- Run config is set once per run on the shared `experiment` resource, not per asset: launchpad key `resources.experiment.config` with `name` (required) and optional `parse`, `chunk`, `embed`, `index`, `tag` sections. Assets read it with `experiment.config()`. Over GraphQL: `{"resources": {"experiment": {"config": {...}}}}`.
+- Ingest end to end in Dagster: launch `ingest_job` for a partition with `resources.experiment.config` set. Changing `embed.dimension` needs a new experiment name, because a collection's vector size is fixed.
 - A stage reads the previous stage's files from `data/artifacts/<experiment>/<stage>/`, so `chunks` needs `parsed_document` run first under the same experiment name (selecting both assets in one run does this).
-- Chunk sizes are counted with the Qwen3 Hugging Face tokenizer (`EmbedConfig.tokenizer`), cached in the `model_cache` volume. Headings are embedded with each chunk and use part of `max_tokens`.
-- Semantic chunking caches sentence-group embeddings in `data/artifacts/_cache/embeddings/`, shared across experiments.
 - The Postgres init script that creates `rag_metrics` only runs when the data volume is first created. Schema changes go through new numbered files in `src/rag_lab/metrics/migrations/`, never by editing an applied one.
 - `sqlalchemy<2.1` is pinned: SQLAlchemy 2.1 switches the default Postgres driver to psycopg 3, which breaks dagster-postgres.
 - Running tests without a local `uv`: `docker compose run --rm --no-deps -e UV_NO_CACHE=1 -v ./tests:/app/tests dagster-code sh -c "uv pip install --system -q pytest && python -m pytest /app/tests -q"`. In Git Bash prefix it with `MSYS_NO_PATHCONV=1`.
-- The search CLI loads an experiment's settings from the newest `rag_metrics.experiments` row with that name (written by `parsed_document` and `chunks`), so it only works for experiments that have been ingested at least that far.
-- `rag_lab.search.quick.ask(query, experiment, top_k, modality, log)` and `summary(names)` are the notebook entry points (`summary` shows the `experiment_summary` view). It runs on the host (not in a container), reads `.env`, maps `host.docker.internal` to `localhost` for Ollama, and reaches Postgres and Qdrant at `127.0.0.1` (`localhost` hangs on IPv6).
-- Retrieval quality metrics need expected results in `eval/queries.yaml` (`{source_file, contains}`, `{source_file, page}` or `{chunk_id}` items; `contains` is a case- and whitespace-insensitive snippet of the hit's text and is the right judge when comparing chunkers, because pages and chunk ids differ between them). Until those are filled in, the benchmark records latency and scores only and leaves quality metrics null. The query set version is a hash of the file.
-- Benchmark: materialise `search_benchmark` with `resources.experiment.config.name` (optional `ops.search_benchmark.config`: `top_k`, `repeats`, `queries_file`). It reads the experiment's settings from the `experiments` table like the search CLI, not from the run config. `SELECT * FROM experiment_summary` (a view) compares experiments; `experiment_summary` is the asset that shows it in the UI. A Dagster asset only gets run config through a parameter named `config`.
+- The search CLI loads an experiment's settings from the newest `rag_metrics.experiments` row with that name, so it only works for experiments that have been ingested at least through `chunks`.
+- `rag_lab.search.quick.ask(query, experiment, top_k, modality, log)` is the notebook entry point. It runs on the host (not in a container), reads `.env`, maps `host.docker.internal` to `localhost` for Ollama, and reaches Postgres and Qdrant at `127.0.0.1` (`localhost` hangs on IPv6).
+- The `ui` service uses the shared image, runs from `/app/ui` so it finds `ui/.streamlit/config.toml`, and bind-mounts `./src` and `./ui`. After editing a module other than the page scripts (for example `ui/style.py` or `ui/data.py`), restart it: `docker compose restart ui`. A new dependency needs `docker compose up -d --build`. Colours follow the dataviz palette validated for a dark surface (`ui/style.py`).
+- Streamlit's app tester (`streamlit.testing.v1.AppTest`) can drive the pages, including uploads, but not `st.data_editor` (set its widget state through `session_state[key]`) or download buttons.
 
-- Matrix run: `experiments/matrix.yaml` lists models (label to Ollama model), strategies, shared settings and documents; experiments are named `<label>-<strategy>` (`q3-4b-fixed`). Run it inside `dagster-code`: `docker compose exec -d dagster-code sh -c "python -m rag_lab.experiments run experiments/matrix.yaml > data/matrix.log 2>&1"` (`--dry-run` lists the experiments, `--only 'q3-4b-*'` selects some, `--force` redoes finished ones). It calls `dagster.materialize`, so every run is in the Dagster UI. An experiment is skipped when its collection already holds the document and a benchmark on the current query set is finished.
-- Two experiment names with identical settings share a config hash, so the `experiments` row keeps only the last name (and config). The old `docs` experiment became `q3-0-6b-hybrid` this way; its `docs` collection is now unused.
-- Models are compared on quality metrics (nDCG, recall, MRR) and ranks only. Similarity scores are on a different scale for each model.
-- The `ui` service uses the shared image (`streamlit` is a dependency, so adding it needed `docker compose up -d --build`), runs from `/app/ui` so it finds `ui/.streamlit/config.toml`, and bind-mounts `./src` and `./ui`. After editing a module other than the page scripts (for example `ui/style.py`), restart it: `docker compose restart ui`. Colours follow the dataviz palette validated for a dark surface (`ui/style.py`).
-
-## Layout (planned)
+## Layout
 
 ```
 docker-compose.yml
@@ -93,31 +97,29 @@ docker/dagster/              # Dockerfile, dagster.yaml, workspace.yaml
 docker/postgres/init/        # creates the rag_metrics database on first start
 src/rag_lab/
   definitions.py             # Dagster Definitions entry point
+  ingest.py                  # stage bodies shared by the assets, the Upload page and the benchmark
   config.py                  # experiment + stage config models
   resources/                 # OllamaResource, QdrantResource, MetricsStoreResource
-  parsing/                   # Docling converter factory and options
-  chunking/                  # segment.py, sectioned.py, one module per strategy, base.py registry, tokens.py
-  embedding/                 # ollama.py (embedder), vectors.py, cache.py (on-disk embedding cache)
-  storage/                   # Qdrant collection setup and upsert
-  search/                    # engine.py (search()), __main__.py (CLI), quick.py (ask() and summary() for notebooks)
-  experiments/               # matrix.py (expands matrix.yaml), __main__.py (the runner)
-  benchmark/                 # queries.py (loads eval/queries.yaml), runner.py (run_benchmark)
-  metrics/                   # timing, latency stats, retrieval.py (quality formulas), summary.py (summary table), Postgres store,
+  parsing/                   # Docling converter factory and options; parse_pdf reads through DoclingReader
+  chunking/                  # segment.py (blocks, reference text), sectioned.py, spans.py, one module per strategy, base.py registry, tokens.py, llamaindex.py (the llamaindex engine)
+  embedding/                 # ollama.py (embedder), vectors.py, cache.py (on-disk embedding cache), llamaindex.py (BaseEmbedding adapter)
+  storage/                   # Qdrant collection setup, delete and query (writes go through LlamaIndex's store)
+  search/                    # engine.py (search()), __main__.py (CLI), quick.py (ask() for notebooks)
+  benchmark/                 # runner.py (a report's run), report.py (report as data), pdf.py (reportlab)
+  metrics/                   # timing, latency stats, retrieval.py (quality formulas), Postgres store (stage metrics, search log, reports),
                              # migrations/*.sql (numbered; applied at start-up by MetricsStoreResource)
   assets/                    # Dagster assets, jobs, sensors
 notebook/                    # search.ipynb: try queries with `ask(query, experiment)`; kernel = host .venv
-data/raw/                    # drop PDFs here (git-ignored)
+data/raw/                    # drop PDFs here for Dagster (git-ignored)
+data/uploads/                # PDFs uploaded in the UI (git-ignored)
 data/artifacts/              # per-stage outputs (git-ignored)
-eval/queries.yaml            # query set for the benchmark (30 queries on aiayn.pdf with expected results)
-experiments/matrix.yaml      # models x strategies for the comparison run
-ui/                          # Streamlit app: app.py, dashboard.py, query.py, charts.py, data.py, style.py, .streamlit/config.toml
+ui/                          # Streamlit app: app.py, upload.py, query.py, benchmark.py, preview.py, charts.py, data.py, style.py, .streamlit/config.toml
 tests/                       # a few pure-logic tests only (see "Working style")
 ```
 
-## Commands (planned)
+## Commands
 
 ```powershell
-docker compose exec dagster-code python -m rag_lab.experiments run experiments/matrix.yaml --dry-run   # list the 15 experiments
 # the UI is at http://localhost:8501 (docker compose up -d)
 docker compose up -d --build          # start the stack
 docker compose logs -f dagster-code   # code location logs

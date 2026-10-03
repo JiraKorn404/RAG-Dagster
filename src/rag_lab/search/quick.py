@@ -1,12 +1,11 @@
-"""One-call helpers for notebooks: `ask("query", "experiment")` and `summary()`. They run on the
-host, not in a container."""
+"""One-call helper for notebooks: `ask("query", "experiment")`. It runs on the host, not in a
+container."""
 
 import os
 from pathlib import Path
 
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.metrics.store import MetricsStore
-from rag_lab.metrics.summary import summary_markdown
 from rag_lab.search.engine import SearchResult, load_experiment, search
 from rag_lab.storage.qdrant import QdrantStore
 
@@ -34,19 +33,6 @@ def _metrics_store(env: dict[str, str]) -> MetricsStore:
         or f"postgresql://{_setting('POSTGRES_USER', env)}:{_setting('POSTGRES_PASSWORD', env)}"
         "@127.0.0.1:5432/rag_metrics"
     )
-
-
-def summary(names: list[str] | None = None) -> None:
-    """Show the experiment_summary view: one column per experiment, one row per metric.
-    `names` limits it to those experiments (default: all)."""
-    from IPython.display import Markdown, display
-
-    columns, rows = _metrics_store(_read_env_file()).experiment_summary()
-    if names:
-        rows = [r for r in rows if r[0] in names]
-    if not rows:
-        raise ValueError("No matching experiments in rag_metrics.")
-    display(Markdown(summary_markdown(columns, rows)))
 
 
 def ask(

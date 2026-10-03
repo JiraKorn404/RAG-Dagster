@@ -2,12 +2,10 @@ from dagster import AssetExecutionContext, Failure, MaterializeResult, MetadataV
 
 from rag_lab.assets.partitions import documents_partitions
 from rag_lab.documents import scan_raw
+from rag_lab.ingest import SCANNED_PDF_CHARS_PER_PAGE, record_parse, register_experiment
 from rag_lab.parsing.parse import parse_pdf
 from rag_lab.paths import artifacts_dir
 from rag_lab.resources import ExperimentResource, MetricsStoreResource
-
-# Below this many extracted characters per page, the PDF is almost certainly scanned images.
-SCANNED_PDF_CHARS_PER_PAGE = 50
 
 
 @asset(partitions_def=documents_partitions, group_name="ingestion")
@@ -22,37 +20,16 @@ def parsed_document(
         raise Failure(f"No PDF in data/raw with content hash {doc_id} (changed or removed?)")
 
     store = metrics.store()
-    config_hash = config.config_hash()
-    store.upsert_experiment(config_hash, config.name, config.model_dump(mode="json"))
+    config_hash = register_experiment(store, config)
 
     parsed = parse_pdf(path, doc_id, config.parse, artifacts_dir(config.name, "parse"))
-    if parsed.status == "failure":
-        raise Failure(f"Docling failed on {path.name}: {parsed.errors}")
     if parsed.chars_per_page < SCANNED_PDF_CHARS_PER_PAGE:
         context.log.warning(
             f"{path.name}: only {parsed.chars_per_page} characters per page. This looks like a "
             "scanned PDF; OCR is off, so there is little text to ingest."
         )
 
-    store.add_stage_metric(
-        config_hash,
-        doc_id,
-        "parse",
-        duration_ms=parsed.parse_seconds * 1000,
-        items=parsed.pages,
-        throughput=parsed.pages_per_second,
-        details={
-            "source_file": parsed.source_file,
-            "status": parsed.status,
-            "tables": parsed.tables,
-            "table_cells": parsed.table_cells,
-            "text_items": parsed.text_items,
-            "chars_per_page": parsed.chars_per_page,
-            "model_load_seconds": parsed.model_load_seconds,
-            "errors": parsed.errors,
-        },
-        dagster_run_id=context.run_id,
-    )
+    record_parse(store, config, doc_id, parsed, context.run_id)
 
     return MaterializeResult(
         metadata={

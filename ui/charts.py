@@ -1,4 +1,4 @@
-"""Altair charts in the dashboard's dark style. Each takes a frame with name, model, strategy, value."""
+"""Altair charts in the app's dark style. Each takes a frame with name, model, strategy, value."""
 
 import altair as alt
 import pandas as pd
@@ -77,25 +77,3 @@ def grouped_bars(df: pd.DataFrame, unit: str, fmt: str = ".3f", height: int = 30
         )
     )
     _finish(chart, height)
-
-
-def query_grid(df: pd.DataFrame, experiments: list[str], queries: list[str], height: int) -> None:
-    """Queries by experiment: bright when the first relevant hit is near rank 1, grey when missed."""
-    df = df.assign(score=df["rank"].map(lambda r: 0.0 if pd.isna(r) else 1.0 / r))
-    base = alt.Chart(df).encode(
-        x=alt.X("name:N", sort=experiments, title=None, axis=alt.Axis(orient="top", labelAngle=-45)),
-        y=alt.Y("query_id:N", sort=queries, title=None),
-    )
-    cells = base.mark_rect(stroke=style.SURFACE, strokeWidth=2, cornerRadius=3).encode(
-        color=alt.condition(
-            alt.datum.score == 0,
-            alt.value(style.GRID),
-            alt.Color("score:Q", scale=alt.Scale(domain=[0, 1], range=style.RAMP), legend=None),
-        ),
-        tooltip=[
-            alt.Tooltip("name:N", title="Experiment"),
-            alt.Tooltip("query_text:N", title="Query"),
-            alt.Tooltip("rank:Q", title="First relevant rank"),
-        ],
-    )
-    _finish(cells, height)

@@ -4,6 +4,8 @@ x-dagster-env: &dagster-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
   DATA_DIR: /app/data
+  # LlamaIndex's sentence splitter downloads NLTK data on first use; keep it in the model_cache volume.
+  NLTK_DATA: /root/.cache/nltk_data
   QDRANT_URL: http://qdrant:6333
   METRICS_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rag_metrics
 
@@ -44,8 +46,6 @@ services:
     volumes:
       - ./src:/app/src
       - ./data:/app/data
-      - ./eval:/app/eval
-      - ./experiments:/app/experiments
       # Docling model downloads (Hugging Face + Docling's own cache) land here, not in the image.
       - model_cache:/root/.cache
       - dagster_storage:/opt/dagster/storage
@@ -92,6 +92,10 @@ services:
     volumes:
       - ./src:/app/src
       - ./ui:/app/ui
+      # The upload page parses, chunks and embeds in this container: uploads and artifacts under
+      # ./data, and Docling's models and the Qwen3 tokenizer in the shared cache volume.
+      - ./data:/app/data
+      - model_cache:/root/.cache
     depends_on:
       postgres:
         condition: service_healthy

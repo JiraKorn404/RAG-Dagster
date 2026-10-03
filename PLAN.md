@@ -388,9 +388,396 @@ Changes from the plan, and notes:
 
 Decided (2026-10-02): the document is `aiayn.pdf`; I draft the query set and you review it; the UI is one Streamlit app with two pages, run as a Docker service; the design should look polished (see 7.3).
 
+## Phase 8 — Ingestion on LlamaIndex
+
+Goal: do document ingestion (read, chunk, index) with LlamaIndex components instead of our own code, with the same outputs: the same four Dagster stages and on-disk intermediates, the same Qdrant collection layout and payload, the same metrics in `rag_metrics`, and the same search, benchmark and UI. Nothing downstream of ingestion changes.
+
+The plan was written after reading the code and the current packages (`llama-index-core` 0.14.25, `llama-index-readers-docling` 0.5.0, `llama-index-node-parser-docling` 0.5.0, `llama-index-vector-stores-qdrant` 0.10.3). Where a step says "verify", the package source did not settle it.
+
+### What LlamaIndex replaces, and what stays
+
+| Stage | Today | With LlamaIndex |
+|---|---|---|
+| Read the PDF | `build_converter()` + `converter.convert()` in `parsing/parse.py` | `DoclingReader(doc_converter=build_converter(cfg), export_type=JSON)`. Docling stays the parser: LlamaIndex has no PDF reader with table structure of its own (its default `PDFReader` is plain pypdf and drops tables; LlamaParse is a paid cloud service). |
+| `hybrid`, `hierarchical` | Docling's chunkers called directly (`chunking/native.py`) | `DoclingNodeParser(chunker=<the same chunker with the Markdown table serialiser>)` |
+| `fixed` | own token windows (`fixed.py`) | `TokenTextSplitter` |
+| `recursive` | own separator recursion (`recursive.py`) | `SentenceSplitter` (paragraph, then sentence, then word) |
+| `semantic` | own (`semantic.py`) | `SemanticSplitterNodeParser`, then `SentenceSplitter` on nodes still over the limit |
+| Embed | `OllamaEmbedder` | **unchanged**; seen by LlamaIndex through a small `BaseEmbedding` adapter that only `SemanticSplitterNodeParser` uses |
+| Index | `QdrantStore.upsert` | `QdrantVectorStore.add` on a collection that `QdrantStore.ensure_collection` created |
+| Segmenting, tables, page and heading bookkeeping | `chunking/segment.py`, `sectioned.py` | **unchanged**: LlamaIndex splitters work on plain text, so tables, headings, pages and bounding boxes still come from our Docling-aware segmenter |
+
+### Decisions
+
+| Topic | Decision | Reason |
+|---|---|---|
+| Replace or add | Add beside the current code first. `ChunkConfig.engine` (`llamaindex`, or `native`) picks the chunker. It was `native` by default at first; it is `llamaindex` since 2026-10-03 (see 8.5). Parse, embed and index move to LlamaIndex outright, because their output is the same. Retire the native chunkers only after the comparison run (8.4). | The chunkers are the only part whose results change. Keeping both lets the benchmark say whether the move costs quality, and the 15 existing experiments stay as the baseline. |
+| `engine` and the hash | `config_hash()` leaves `chunk.engine` out when it is `native`, the same way it leaves out unused strategy settings. | Existing hashes and rows stay valid; a `llamaindex` experiment gets a different hash. One added assertion in the config hashing test. |
+| `IngestionPipeline` | Not used. Each Dagster asset calls its LlamaIndex components itself. | A single pipeline run would merge the four stages into one and drop the per-stage files and metrics that the design rules require. Its docstore dedup is an idea (below). |
+| Embedding | Keep our `OllamaEmbedder`. Do not add `llama-index-embeddings-ollama`. | The stock class does not report Ollama's `total_duration`, `load_duration` and `prompt_eval_count` (the embed metrics), does no Matryoshka truncation or re-normalisation, and joins the query instruction with a space instead of `Instruct: ...\nQuery: ...`. |
+| Embedded text | The headings go in each Document's metadata as the one key visible to the embedder, with `metadata_template="{value}"`, `metadata_separator="\n"` and `text_template="{metadata_str}\n{content}"`. The chunk text that is stored and embedded is `node.get_content(MetadataMode.EMBED)`. `include_headings_in_text=false` puts the key in `excluded_embed_metadata_keys`. | LlamaIndex's splitters reserve room for the embed-visible metadata, which reproduces "headings use part of `max_tokens`". The text comes out as today (headings, newline, body). |
+| Token counting | Pass the Qwen3 Hugging Face tokenizer (`encode(text, add_special_tokens=False)`) as the splitters' `tokenizer`. | `max_tokens` keeps meaning what the embedder sees. LlamaIndex's default tokenizer is tiktoken, which would count differently. |
+| Page and bounding box | Found by searching for each node's body in its section text (from the previous chunk's start, so overlapping chunks work), then `Section.locate()`, as today. For the Docling chunkers, from the node metadata's `doc_items` (`label`, `prov`). | LlamaIndex splitters copy the section's metadata to every child, so per-chunk page needs the character offset. Its own `start_char_idx` is relative to the intermediate node after the semantic strategy's second pass, so one search is used for all strategies. |
+| Qdrant payload | Node metadata carries the flat fields (`chunk_id`, `modality`, `strategy`, `page`, `headings`, `bbox`, `token_count`, `experiment`, `config_hash`, `source_file`, `ingested_at`) plus `text`, with `text` excluded from embed and LLM views. The Document id is our `doc_id`; node ids are `to_point_id(chunk_id)`. | `search()` reads `text` and the other fields straight from the payload, and the payload indexes and `delete_document` filter on `doc_id`. LlamaIndex writes `doc_id` from the source Document's id, so setting it keeps both working. |
+| Dependencies | `llama-index-core`, `llama-index-readers-docling`, `llama-index-node-parser-docling`, `llama-index-vector-stores-qdrant`. | The stated need: one package per replaced stage. They need `numpy>=2` and `qdrant-client>=1.16`; check that `uv` resolves them next to Docling and the `sqlalchemy<2.1` pin (8.0). |
+
+### 8.0 Groundwork
+
+- [x] Add the four packages to `pyproject.toml`; rebuild the shared image once (`docker compose up -d --build`).
+- [x] Set `NLTK_DATA=/root/.cache/nltk_data` on the code and UI services: LlamaIndex's sentence splitter downloads NLTK's `punkt` data on first use, and `/root/.cache` is the `model_cache` volume, so it survives rebuilds. The first run needs internet.
+- [x] `config.py`: `ChunkConfig.engine`, the hash rule above, and the matching assertion in the hashing test.
+
+### 8.1 Read (`parsed_document`)
+
+- [x] `parsing/parse.py` calls `DoclingReader` with our converter (`do_ocr` off and every `ParseConfig` option still applied), with `id_func` returning the document's content-hash id so the Document id is our `doc_id`. The Docling JSON, Markdown and `.meta.json` files are written as before, from the Document's JSON text.
+- [x] Loses: `status` `partial_success` and the `errors` list. The reader calls `convert()` with Docling's default of raising on error, so a failed parse fails the asset with Docling's message. Pages, tables, characters and the scanned-PDF check come from the loaded Docling document. `model_load_seconds` is still timed (`initialize_pipeline` runs first), so `parse_seconds` stays comparable with the existing rows.
+
+### 8.2 Chunk (`chunks`)
+
+- [x] `chunking/llamaindex.py`: one function, `chunk_llamaindex(ctx)`, which `chunk_document` calls when `engine = llamaindex` (no registry entry per strategy). It returns the same `Chunk` objects, so `write_chunks`, `summarise` and everything after `chunks` are untouched.
+- [x] `hybrid`, `hierarchical`: wrap the saved Docling JSON in a Document and run `DoclingNodeParser` with the chunker built as in `native.py`. Node text is the chunk body without headings, so `Chunk.text` adds the headings (joined by newline) when `include_headings_in_text` is on, which is what Docling's `contextualize()` does. Modality (`table` if any `doc_item` is a table), page and bbox come from the node metadata; `table_handling` `skip` and the `row-wise` warning behave as today.
+- [x] `fixed`, `recursive`, `semantic`: `segment()` yields sections and tables as now. Each section becomes a Document (headings metadata as above, page and bbox kept in excluded keys); tables skip the splitter and follow `table_handling` as today. The splitter is built once per document with `chunk_size = max_tokens`. Pass `chunk_overlap = 0` explicitly for `recursive` and `semantic` (`SentenceSplitter`'s default is 200).
+- [x] `semantic`: `SemanticSplitterNodeParser` with our sentence pattern as its `sentence_splitter`, then `SentenceSplitter` for oversize nodes. The embedding adapter (`BaseEmbedding` over `OllamaEmbedder`, document mode) wraps `embed_cached`, so the on-disk sentence-group cache still applies, and it counts texts, cache hits and milliseconds for the chunk metrics.
+- [x] The chunk metrics row and asset metadata are unchanged in shape; `details` gains `engine`.
+
+What does not carry over, so the `llamaindex` results are comparable in quality, not chunk-for-chunk identical:
+
+| Setting | With `engine = llamaindex` |
+|---|---|
+| `recursive.separators` | Not used; `SentenceSplitter` has its own order. A non-default value raises an error rather than being ignored. |
+| `semantic.breakpoint_type` | Only `percentile` (as an integer). `stddev` and `absolute` raise an error. |
+| `semantic.min_tokens` | Not applied (no merging of small chunks); a warning is logged. |
+| Semantic threshold | Taken per section (LlamaIndex computes it per Document), not over the whole document. A section with one or two sentences never splits. |
+| Semantic stats | `threshold` and `breakpoints` are not reported; sentence and embedding counts come from the adapter. |
+| Heading budget | Reserved by LlamaIndex with a few tokens of format overhead; the cap at half of `max_tokens` is gone, so a very long heading raises an error instead of being clipped. |
+| `fixed` | `TokenTextSplitter` breaks on word boundaries and merges words up to the limit, so windows are not exactly `max_tokens` wide. |
+
+### 8.3 Embed and index
+
+- [x] `embeddings`: no change.
+- [x] `qdrant_index`: build one `TextNode` per chunk (id, text, metadata above, `embedding` from the `.npy` file) and write with `QdrantVectorStore.add`, on a store that takes `QdrantStore.client` and `batch_size=256`. `ensure_collection` and `delete_document` still run first. The store notices the existing collection's unnamed vector and uses it, so `query_points` in `search()` works as it does now (verify against a real collection before relying on it). Each point also gets a `_node_content` payload field with a copy of the node as JSON, so the chunk text is in the payload three times (`text`, the metadata copy inside `_node_content`, and `_node_content`'s own `text`); that does not matter at lab scale. `QdrantStore.upsert` had no other user and is gone.
+- [x] Hybrid (dense plus BM25) search, the optional item in Phase 5, becomes cheaper through this store's `enable_hybrid`, but it is not part of this phase.
+
+### 8.4 Comparison run
+
+- [x] A slice first: `experiments/matrix-llamaindex.yaml`, a copy of `matrix.yaml` with `shared.chunk.engine: llamaindex` and the model labels prefixed `li-` (`li-q3-0-6b`), so the experiments are named `li-q3-0-6b-fixed` and so on. Run the 0.6b model only (`--only 'li-q3-0-6b-*'`), five experiments.
+- [x] Then the other two models, 15 in all.
+- [x] Checks, once: every experiment has a finished benchmark on the same query-set version; the coverage check from Phase 7 (all 30 expected snippets findable in each experiment's chunks); the Phase 7 dashboard and query page show the `li-` experiments next to the native ones with no change; the search CLI and `ask()` find them.
+- [x] Record the per-strategy nDCG@5, recall@5 and MRR next to the native rows in this section, with the chunk counts and token statistics, and note what differs and why.
+
+Done when: `parsed_document` through `qdrant_index` run on LlamaIndex for all five strategies and three models, the comparison is recorded here, and the LlamaIndex experiments score within what the Phase 7 results call noise (about 0.02 to 0.03 nDCG@5, one query is 0.033 of recall@5) of their native counterparts, or the gap is explained by an item in the table above. One real run, no new tests beyond the hashing assertion.
+
+**Status: done (2026-10-03), except 8.5, which waits for your decision.** Checked on the real stack with `aiayn.pdf` and the 30-query set:
+- **Image:** the four packages resolve next to Docling (`llama-index-core` 0.14.25, readers-docling 0.5.0, node-parser-docling 0.5.0, vector-stores-qdrant 0.10.3) and the image rebuilt once. `docker-compose.yml` sets `NLTK_DATA` on all Dagster services and the UI through the shared env block; LlamaIndex downloaded its sentence data into `/root/.cache/nltk_data` on first use.
+- **Read:** the Docling JSON written through `DoclingReader` is byte-identical to the one the old converter call wrote (same MD5 for `aiayn.pdf`), and the parse metrics rows have the same shape. The `status` and `errors` fields are gone from them.
+- **Chunk:** on the same parsed paper, `hybrid` (41 chunks) and `hierarchical` (88) give identical text, page, bounding box, modality and headings in both engines, and `recursive` (44) gives identical chunk texts. `fixed` shares 37 of 45 chunk texts (word-boundary windows, 249.7 tokens on average against 250.0). `semantic` gives 82 chunks against 55 (mean 135 tokens against 198), because small chunks are not merged and the threshold is per section.
+- **Index:** a `li-` collection has an unnamed 1024-dimension cosine vector, the stored vectors equal the `.npy` rows, the payload holds every native field plus LlamaIndex's own (`_node_content`, `_node_type`, `ref_doc_id`, `document_id`), `has_document` and the search CLI work on it without a change, and the matrix runner and the dashboard and query pages (rendered with Streamlit's app tester) run with no exceptions. The Phase 7 coverage check passes: all 30 expected snippets are in the chunks of all 15 `li-` experiments.
+- **Comparison:** the full `matrix-llamaindex.yaml` run finished 15 of 15 in 10.0 minutes (the 0.6b slice, 5 experiments, took 3.8). Every experiment has a finished benchmark on query-set version `1ec485bcb7c0`.
+
+| Strategy | nDCG@5 native | nDCG@5 llamaindex | MRR native | MRR llamaindex |
+|---|---|---|---|---|
+| `fixed` | 0.920 | 0.924 | 0.898 | 0.903 |
+| `hierarchical` | 0.918 | 0.914 | 0.896 | 0.890 |
+| `hybrid` | 0.910 | 0.906 | 0.896 | 0.896 |
+| `recursive` | 0.927 | 0.932 | 0.909 | 0.916 |
+| `semantic` | 0.928 | 0.890 | 0.908 | 0.853 |
+| all 15 | 0.921 | 0.913 | 0.901 | 0.892 |
+
+Mean recall@5 is 0.985 for both engines; mean search p50 is 43 ms against 45 ms and mean seconds per document 41 against 43.
+
+- Four of five strategies are within about 0.005 nDCG@5 of their native counterparts, which is inside the noise (below). The one real gap is `semantic`: 0.038 lower nDCG@5 and 0.055 lower MRR, from the 82 small chunks that follow from the two missing features in the 8.2 table (`min_tokens` merging and the document-wide threshold). It is largest at 0.6b (0.853 against 0.906) and smaller at 8b (0.919 against 0.955).
+- **Noise between identical runs:** `hybrid` has identical chunks and an identical parse in both engines, yet `q3-0-6b-hybrid` and `li-q3-0-6b-hybrid` differ by one query (recall@5 0.933 against 0.900, nDCG@5 0.882 against 0.869). The stored embeddings of the same texts differ by up to 0.005 per component (0.027 for one `fixed` run) between two runs, which is Ollama's own numerical variation. So a gap of one query, and some of the gaps in the 4b and 8b rows (for example `q3-8b-hierarchical` 0.893 against 0.880 with identical chunks), is not the engine.
+
+Changes from the plan, and notes:
+- The page search above replaced `start_char_idx`; `chunk_llamaindex` is one function, not registry entries; the `parse_pdf` result lost `status` and `errors` as planned.
+- `OllamaLabEmbedding` (in `embedding/llamaindex.py`) is used only by the semantic splitter, and routes through `embed_cached`, so a repeat semantic run reuses cached sentence vectors. Its chunk stats are `sentences`, `group_texts`, `embed_cache_hits`, `embedded` and `embed_ms`; `threshold` and `breakpoints` are not reported by LlamaIndex.
+- `sectioned.py` gained `prefix_and_budget()` and a public `table_texts()` (moved out of `chunk_sections`), and `native.py` gained `build_chunker()` and `warn_row_wise()`, so both engines share the heading budget, the table handling and the Docling chunker setup. The native experiments were not re-run after this refactor; in the comparison script the refactored native `hybrid`, `hierarchical` and `recursive` gave the same chunks as LlamaIndex, and the stored `q3-0-6b-hybrid` chunks match them too.
+- `experiments/matrix-llamaindex.yaml` is `matrix.yaml` with `shared.chunk.engine: llamaindex` and `li-` model labels, so no code change was needed in `matrix.py`.
+- `CLAUDE.md` is updated for the engine, the dependencies and the layout.
+- Dashboard fix: the grids and charts are keyed by model and strategy, so a `li-` experiment drew over its native twin. Migration `0004_experiment_summary_engine.sql` adds an `engine` column to `experiment_summary`, and the dashboard has a "Chunk engine" selector in the sidebar that filters the Quality, Speed and Ingestion tabs and the headline cards to one engine. The Queries tab and the Data tab still show every experiment, so native and `li-` can be compared there.
+- The `li-` experiments appear in the query page and the Queries tab next to the native ones. Their Qdrant collections and `data/artifacts/li-*` can be deleted without touching the native ones.
+
+### 8.5 Retire the native chunkers (only after you decide)
+
+Decided (2026-10-03): the native chunkers stay, and `llamaindex` is the default engine. A config that does not set `engine` is now `llamaindex`; `experiments/matrix.yaml` sets `engine: native` so its experiments keep their hashes (otherwise they would share a hash with the `li-` ones). The deletion steps below are not done. The comparison above says `llamaindex` matches `native` for `hybrid`, `hierarchical`, `recursive` and `fixed`, and loses 0.038 nDCG@5 on `semantic`. Retiring `native` means accepting that, or restoring the missing semantic features on the LlamaIndex side.
+
+- [ ] If the results hold: make `llamaindex` the default engine and delete `fixed.py`, `recursive.py`, `semantic.py` and the Docling calls in `native.py`. Keep `segment.py`, `sectioned.py`, `tokens.py` and `embedding/cache.py`, which the LlamaIndex path uses. `engine` can then go, with no migration needed (old hashes stay valid because `native` was never in the hash).
+- [ ] If they do not: keep both. `engine` is a stage choice and stays a config value, in line with the lab rule.
+- [ ] Update `CLAUDE.md` (status line, chunking facts, dependencies, layout) when this lands, not before.
+
+Not included: the stock `OllamaEmbedding`, `IngestionPipeline` and its docstore, LlamaParse, LlamaIndex retrievers and query engines (search stays on `QdrantStore.query`), and any change to the metrics schema, Dagster partitions, benchmark or UI.
+
+## Phase 9 — Upload, chunk preview and embed (Streamlit)
+
+Goal: a new page in the Streamlit app where you upload a PDF, pick a chunking strategy and its parameters, press **Chunk** to see the whole document cut into chunks with visible separators, and press **Embed** to put the chunked document into Qdrant under an experiment name, so it can be searched on "Try a query".
+
+Decided (2026-10-03): the new "tab" is a third page in the app's navigation, beside "Dashboard" and "Try a query".
+
+### How it works
+
+```
+upload PDF -> parse once (Docling, default settings, cached by document id)
+           -> choose engine, strategy, parameters -> Chunk -> preview with separators
+           -> choose embedding model, experiment name -> Embed -> chunks, vectors and points,
+              as if ingest_job had produced them
+```
+
+### Decisions
+
+| Topic | Decision | Reason |
+|---|---|---|
+| Where the work runs | In the Streamlit process of the `ui` container, with the same plain-Python functions the Dagster assets use. No Dagster run is started. | Matches the rule that stages are plain Python and the UI has no Dagster client. The cost is that these runs are not listed in the Dagster UI; the metrics rows in `rag_metrics` are still written. |
+| Where uploads go | `data/uploads/<doc_id>.pdf` (the content-hash id, so the same file twice is one document). Not `data/raw`. | The sensor would register everything in `data/raw` as a partition. Uploading to try a chunker must not add a document to the lab's document set. Moving a file to `data/raw` later gives it the same id. |
+| Parsing | Once per uploaded document, with default `ParseConfig`, cached on disk under `data/artifacts/_uploads/<doc_id>/`. Changing chunk settings never re-parses. | Parsing takes 20 to 30 s on CPU; chunking takes under a second (semantic: seconds, with the sentence cache). The parse options are not on the page (see Ideas). |
+| Chunk settings | The page builds a `ChunkConfig` and calls `chunk_document()`, the same call the `chunks` asset makes, so the preview is what `chunks` would produce. | One code path; no preview-only chunker to drift from the real one. |
+| What the preview shows | Two views of the same chunks. **In the document** (the main one): the parsed document's text, read in order, with a cut mark where each chunk starts and chunks told apart by alternating backgrounds. Where two chunks share text (`fixed` with overlap), that text has its own highlight and a label naming both chunks. Text that is in no chunk (a table under `skip`, heading lines when headings are not embedded) is dimmed. **As embedded**: each chunk as a block (number, modality, page, tokens, headings, then the stored text with its headings prefix dimmed), because the embedded text is the chunk text with its headings added, which the document view cannot show. | You asked to see the original text with cut marks and overlaps. The second view is kept because it is exactly what will be embedded. |
+| The "original" text and where chunks sit in it | The reference text is the document as the segmenter reads it (`chunking/segment.py`): heading lines where the heading path changes, section text with paragraphs separated by blank lines, tables as Markdown. Each `Chunk` gets a `span` (start and end character offsets into that text), recorded by the chunker itself, not found afterwards by searching. | A trial of the search approach on `aiayn.pdf` found only 23 of 41 `hybrid` chunks and 78 of 88 `hierarchical` chunks (Docling's chunk text differs from the paragraph text: formula placeholders, list and caption serialisation), and missed the table chunks of the other strategies. Offsets from the chunker are exact where the chunker knows them. |
+| How spans are known | `fixed`, `recursive`, `semantic`, both engines: the chunk's offset inside its section plus the section's offset (the native engine already has the span; the LlamaIndex engine finds the body in the section text, which is exact because its nodes are substrings). `hybrid`, `hierarchical`: the chunk's Docling `doc_items` are matched by `self_ref` to the paragraphs and tables the segmenter recorded; the span runs from the first to the last of them, narrowed to the matching text when one long paragraph was split across several chunks. A table is one region: its chunks (one, or several when split by rows) all point at the whole table, and the page lists them by number. A chunk with no placeable item (a formula Docling did not decode) gets an empty span where the previous chunk ends, shown as a cut mark with a "no source text" note. | Keeps the position logic in the chunkers, next to the code that already decides the cuts. The one remaining approximation (tables, split paragraphs under `hybrid`) is labelled on the page. |
+| Embed target | Writes `parse`, `chunk`, `embed` and `index` files under `data/artifacts/<experiment>/`, the experiment row, the four stage metric rows, and points in the collection named `<experiment>`. | An embedded upload is then indistinguishable from an ingested document: the "Try a query" page lists it, and a later Dagster run on that experiment finds its inputs. |
+| Experiment name rules | The name must match the existing pattern. A name that exists is refused unless it has the same config hash and no finished benchmark. A config hash that already exists under another name is refused, with that name in the message. | The `experiments` row is keyed by hash and keeps the last name, so a second name for the same settings would rename a matrix experiment in the dashboard (the quirk in `CLAUDE.md`). A benchmarked experiment is a fixed reference point; adding a document would change what its numbers mean. |
+| Embedding models | The Qwen3 embedding models that Ollama reports (`/api/tags`), plus an optional vector size. | The tokenizer used for chunk sizes is the Qwen3 one; other model families are an idea, not part of this phase. |
+| Settings that do not apply | Controls are shown only when the chosen engine and strategy use them: `overlap` for `fixed`; `recursive.separators` and `semantic.min_tokens` for `native`; `stddev`/`absolute` breakpoints for `native`; `merge_peers` for `hybrid`. | The `llamaindex` engine raises an error for several settings. The page should not offer a combination that fails. |
+| Dashboard side effect | The Ingestion tab shows only experiments with a finished benchmark on the selected query set, like the other tabs. | An uploaded experiment has no benchmark but the same model, strategy and engine as a matrix experiment; in the Ingestion charts it would draw over it, the same bug as before the engine filter. |
+
+### 9.0 Groundwork
+
+- [x] `docker-compose.yml`, `ui` service: mount `./data:/app/data` (uploads, artifacts, the sentence-embedding cache) and `model_cache:/root/.cache` (Docling models and the Qwen3 tokenizer; without it they would download again into the container). Recreate the `ui` container once.
+- [x] `src/rag_lab/ingest.py`: move the bodies of the `embeddings` and `qdrant_index` assets, unchanged, into plain functions (`embed_chunks`, `index_chunks`), and the metric-row and experiment-row writing of `parsed_document` and `chunks` into `record_parse` and `record_chunk`. The assets keep the Dagster parts (partition key to document id, `Failure`, `MaterializeResult`, `dagster_run_id`). Missing inputs raise a plain `IngestError`, which the assets turn into `Failure`. No behaviour change.
+- [x] `config.py` or a small helper: the name and hash checks above as one function, `check_experiment_name(store, name, config_hash)`.
+- [x] Spans (so the preview can show the original text): `Chunk` gets an optional `span` field (a pair of offsets; old `.chunks.jsonl` files without it still load). `segment()` gives each block its offset in the reference text and each paragraph the `self_ref` of its Docling item, and `reference_text(blocks)` returns the text. Then the four chunk code paths record spans as described in "How spans are known": `sectioned.chunk_sections` (native `fixed`, `recursive`, `semantic`), `native._convert` (`hybrid`, `hierarchical`), and `llamaindex._section_chunks` and `_docling_chunks`. The Qdrant payload and the metrics are unchanged; spans are only in the chunks file.
+
+### 9.1 Upload and parse
+
+- [x] `ui/upload.py` (the page) and a third entry in `ui/app.py`'s navigation ("Upload", `:material/upload_file:`). `st.file_uploader` accepts PDF only. The upload is hashed, saved, and parsed with `parse_pdf` inside `st.status`; a document already parsed is not parsed again. The scanned-PDF warning (the existing characters-per-page check) is shown on the page. A parsed document stays in `st.session_state`, so a script rerun does not parse again.
+- [x] Shows pages, tables, and parse seconds for the document, as small cards.
+
+### 9.2 Chunk settings and Chunk
+
+- [x] A form: embedding model (it fixes the tokenizer and, for `semantic`, the sentence embeddings), engine, strategy, `max_tokens`, `table_handling`, `include_headings_in_text`, and the strategy's own settings per the "Settings that do not apply" row. Values are the `ChunkConfig` defaults; the form builds a `ChunkConfig`, so a typo or a bad combination fails in the same validation the assets use, shown with `st.error`.
+- [x] **Chunk** runs `chunk_document` (`semantic` needs Ollama, so a failed call is shown, not raised). The result and its config hash are kept in `st.session_state`; changing a setting afterwards marks the preview as out of date until Chunk is pressed again, so the Embed button never embeds chunks that differ from the settings on screen.
+- [x] Above the preview: chunk count, count by modality, token minimum, mean and maximum, and the engine's warnings (for example "overlap is only used by fixed").
+
+### 9.3 Preview
+
+- [x] **In the document** (default view). The reference text is cut at every chunk start and end; each stretch is covered by no chunk, one chunk, or two or more. One chunk: alternating background colours, with a cut mark at its start (`#12 · 340 tokens · p. 4`). Two or more (overlap): a separate highlight colour and a label with the chunk numbers. No chunk: dimmed. Table regions get a header naming their chunk numbers. Text is HTML-escaped and kept as `white-space: pre-wrap`, built like the hit cards on the "Try a query" page and using the page's palette.
+- [x] A short key above the document (the colours and what a cut mark is), and a count of chunks whose span is approximate (a table, or a paragraph split by `hybrid`).
+- [x] **As embedded**: one block per chunk (header bar, then the stored text with its headings prefix dimmed). Table chunks show their Markdown source in a monospace block.
+- [x] Both views are paged, 100 chunks per page with a selector above them; the document view shows the reference text from the first chunk of the page to the first chunk of the next page. Overlap that crosses a page boundary is highlighted on both pages. Nothing else is limited.
+
+### 9.4 Embed
+
+- [x] A section under the preview: experiment name (default `up-<file name>-<strategy>`, lower-cased and cleaned to the name pattern), and the check above. **Embed** is enabled only when the preview is current and the name passes.
+- [x] **Embed** runs inside `st.status`: copy the cached parse files and write the chunks file under `data/artifacts/<experiment>/`, `record_parse` and `record_chunk` (from the saved parse metadata and the chunk run), `embed_chunks`, `index_chunks`. On success it shows chunks embedded, tokens per second, points in the collection, and the experiment name to pick on "Try a query"; on failure it shows which step failed and leaves earlier files in place (a rerun overwrites them, as `qdrant_index` already deletes the document's points first).
+- [x] Not included here: a benchmark button. An uploaded document has no entries in `eval/queries.yaml`, so quality metrics would be empty; `search_benchmark` from Dagster still works on the experiment for latency.
+
+### 9.5 Dashboard
+
+- [x] `ui/dashboard.py`: the Ingestion tab uses only the experiments that have a finished benchmark on the selected query set (the names that `data.benchmark_metrics()` returns), as the other tabs already do. The Data tab keeps showing every experiment.
+
+**Status: done (2026-10-03).** Checked on the real stack with `aiayn.pdf`: the page was driven end to end with Streamlit's app tester (it supports uploads), and the extracted asset code was run through Dagster's CLI.
+- **Spans** (every chunk's span against the reference text, all five strategies in both engines):
+  - `fixed`, `recursive`, `semantic`: the text inside every non-table span equals the chunk's body, ignoring whitespace. `fixed` 40 exact, `recursive` 39, `semantic` 50 (native) and 77 (llamaindex); in each the other 5 are table pieces (tables 2 to 4 are split by rows), marked approximate. No wrong span. `fixed` with overlap 64 has 6 overlapping neighbour pairs, and every span start is non-decreasing.
+  - `hybrid` (41 chunks): 25 equal, 14 contained, 2 approximate (the split tables), 0 empty, 0 wrong. `hierarchical` (88): 75 equal, 7 contained, 6 with no source text (undecoded formulas), 0 wrong. Both engines give the same numbers. "Contained" is a weaker test than "equal": for text chunks it checks the first and last six words are inside the span, for table chunks only that the span is a table region of at least half the chunk's length; the chunk text differs from the paragraph text in list markers (`[1]`), formula placeholders and the table Markdown's formatting.
+  - The native engine's chunks for all five strategies are identical to the stored `q3-0-6b-*` ones (text, page, bounding box, modality, headings, ids, token counts) after the span changes.
+- **The page:** uploading `aiayn.pdf` parsed it in 33 s and showed 15 pages, 5 tables. `fixed` with overlap 64 gave 45 chunks and a document view with 48 marks (40 chunk starts, 2 approximate table regions, 6 overlap labels); changing a setting marked the preview out of date and disabled Embed; `hybrid` gave 45 marks including 1 approximate region; a malformed name, and the name of an existing experiment, were refused. Embedding `hybrid` with max tokens 480 as `p9-test` gave 41 chunks and 41 points, the four metric rows (parse, chunk with `engine: llamaindex`, embed, index), the `parse`, `chunk` and `embed` files under `data/artifacts/p9-test/`, and the experiment showed up on "Try a query" (the CLI search returned the multi-head attention section first, similarity 0.733).
+- **Dagster:** `parsed_document` through `qdrant_index` ran for a new experiment through `dagster asset materialize` with the code now in `ingest.py` (44 points, four metric rows).
+- **Dashboard:** with the two test experiments in the database, the filter the Ingestion tab now uses (benchmarked names only) leaves the 15 experiments of an engine and none of the uploads (computed with the same expression, not read off the rendered charts), and the dashboard and query pages render with no exceptions. The test experiments, their collections, files and metric rows were removed afterwards.
+
+Changes from the plan, and notes:
+- **Settings that equal a benchmarked experiment cannot be embedded.** The config hash does not include the document, so the page's defaults (and any settings that match a matrix experiment) have the same hash as, for example, `li-q3-0-6b-hybrid`, and the name rule refuses them: the message tells you to change a setting, for example max tokens. That follows the plan's rule, but it means the first upload with default settings cannot be embedded as is. Lifting it needs the `experiments` table to be keyed by name instead of hash (or the hash to include the document); neither was done in this phase. Phase 10 plans a fix that keeps the schema.
+- **Not seen in a browser.** The document and chunk views were checked by their HTML (mark counts, labels, no exceptions), not by looking at them, so the colours and layout in `style.py` are unverified visually.
+- `Chunk` has two new fields, `span` and `span_approx`; the span of a one-chunk table is exact, and of a split table approximate. `sectioned.table_chunks()` builds table chunks for both engines (it replaces two copies), `chunking/spans.py` places Docling's chunks, and `segment.reference_text()` defines the text.
+- The extracted functions in `rag_lab/ingest.py` are `register_experiment`, `record_parse`, `record_chunk`, `embed_chunks`, `index_chunks` and `check_experiment_name`; the assets are wrappers around them. `parsed_document` now registers the experiment before parsing and the parse row after, as before.
+- The name check also refuses an existing name only when its settings differ or it has been benchmarked, as planned; the message for a hash that already belongs to a benchmarked experiment says to change a setting.
+- The `ui` service mounts `./data` and the `model_cache` volume. Uploads are saved as `data/uploads/<doc_id>/<file name>` and parsed into `data/artifacts/_uploads/<doc_id>/`.
+
+Not included: parse options on the page, choosing an existing document from `data/raw`, editing chunks by hand, a benchmark from the page, and deleting an uploaded experiment (delete the Qdrant collection and `data/artifacts/<name>` by hand).
+
+Done when: after `docker compose up -d`, a PDF uploaded on the new page is parsed, chunked with two different strategies (the document view changes and shows the cut marks; with `fixed` and an overlap the shared text is highlighted), embedded under a new name, and the same question on "Try a query" returns chunks from it; the same name is refused a second time with other settings; the dashboard grids and charts are unchanged. One real run through the browser or Streamlit's app tester, one `ingest_job` run to confirm the extracted asset code still works, and one throwaway script over `aiayn.pdf` for all five strategies in both engines that checks every span: for `fixed`, `recursive` and `semantic`, the reference text inside the span equals the chunk's body (ignoring whitespace); for `hybrid` and `hierarchical`, it contains it, except chunks with no source text; the numbers are recorded here. Spans only drive a display, so no test file. No new tests: nothing in this phase is retrieval-metric, truncation or hashing logic.
+
+## Phase 10 — Name your own experiment, or add to an existing one (Upload page)
+
+Goal: on the Upload page's Embed step, choose between two things. **A new experiment** under any unused name you type, even when its settings equal another experiment's. **An existing experiment** whose settings equal the ones on the page, to add the document to it. This replaces the Phase 9 rule that refused a name or settings that belonged to another experiment.
+
+### Why it is refused today, and the change
+
+The `experiments` row is keyed by the config hash, and the hash covers the settings only. Two experiments with the same settings are therefore one row, and the metrics tables (`ingestion_stage_metrics`, `benchmark_runs`, `search_log`) are tied to that hash too. A second name would rename the first experiment and mix the numbers of two collections. The fix keeps the schema and gives an experiment its own identity when it needs one:
+
+- `ExperimentConfig` gets an optional `tag`. When it is set it is part of `config_hash()`; when it is empty it is left out, as `engine` `native` was, so every existing hash stays the same.
+- An experiment created on the Upload page gets `tag = its name`, so its hash is its own. Matrix experiments have no tag and keep their hashes.
+- A second hash, `settings_hash()`, ignores the name and the tag. "The settings are the same" means the same `settings_hash()`.
+
+### Decisions
+
+| Topic | Decision | Reason |
+|---|---|---|
+| New experiment | Any name that matches the name pattern and is not used: no `experiments` row has it and no Qdrant collection has it. The name field starts with a suggestion you can overwrite. | A name only has to be unique. Refusing an existing collection (for example the unused `docs`) avoids writing into something that was not made by the page. |
+| Existing experiment | A list of the experiments whose `settings_hash()` equals the page's, shown with their document count, point count and whether they have been benchmarked. Hidden when none match. The document goes into that experiment's collection under its name and hash. | Only experiments with the same settings are offered, so the vectors and chunks are comparable. |
+| A benchmarked experiment | Allowed, behind a checkbox you must tick, with the consequences stated next to it: its benchmark numbers were measured without this document and are not redone; its collection and its ingestion numbers in the dashboard (pages, chunks, seconds per document) now cover two documents. | You asked for it. The earlier refusal protected reference results; now it is a choice you confirm. |
+| Hash of an existing row | The page takes the stored `config_hash` of the selected experiment as it is, and checks that the page's settings produce it (plus its tag). It never rebuilds the hash from the stored config JSON. | Rows made before `engine` existed have no `engine` key, and a rebuilt config would default to `llamaindex` and give a different hash. |
+| Dagster re-runs of a tagged experiment | `ExperimentResource` gets the same optional `tag`, so a run config for an upload experiment can include it; the search CLI and the benchmark need nothing, because they read the stored settings by name. | Without the tag in the run config an asset would compute the untagged hash and write its rows under the wrong experiment. This is stated in `CLAUDE.md`. |
+
+### 10.0 Config
+
+- [x] `config.py`: `ExperimentConfig.tag`, `config_hash()` including it only when set, and `settings_hash()` ignoring name and tag (one shared helper). `ExperimentResource.tag`, passed to `config()`. One added test: an empty tag leaves the hash as it was, a tag changes it, and `settings_hash()` ignores it. This is config hashing, which the project tests.
+
+### 10.1 Store and ingest functions
+
+- [x] `MetricsStore.list_experiments()`: name, config hash, config, and per experiment the number of documents (distinct `doc_id` in the stage metrics), whether a benchmark has finished, and the newest creation time.
+- [x] `ingest.py`: `check_new_experiment_name(store, qdrant, name)` replaces `check_experiment_name`. `experiments_with_settings(store, settings)` returns the rows to offer: an untagged row matches when its stored hash equals the page's `settings_hash()`; a tagged row (made by this page, so its config has `engine`) matches when the hash recomputed without its tag does. The Qdrant point count of each is read for the display only.
+
+### 10.2 The Embed step on the page
+
+- [x] A radio, "Embed into": "A new experiment" (default) or "An existing experiment with the same settings" (disabled when the list is empty). New: the name field and the checks above; the experiment is created with `tag = name`. Existing: a selector over the list, the benchmark notice and checkbox when it applies, and no name field.
+- [x] The embed steps are the ones from Phase 9. In the existing case the config is the selected experiment's name and tag with the page's settings, and the step stops with an error if its hash is not the stored one. Parse and chunk files and the stage rows for this document go under that experiment; its collection gets the new points; adding the same document again overwrites its points, as `index_chunks` already does.
+- [x] The success message names the experiment and the collection's new point count.
+
+### 10.3 Dashboard
+
+- [x] An experiment that has been benchmarked and shares model, strategy and engine with another one would still draw over it in the grids. A caption above the grid lists such pairs by name when it finds them. No change to the charts.
+
+### 10.4 Docs
+
+- [x] `CLAUDE.md`: replace the line that says settings equal to a matrix experiment cannot be embedded, and the quirk about two names sharing a hash (it now applies only to untagged experiments); note `tag` and `settings_hash()`.
+
+Done when, checked once on the real stack through Streamlit's app tester: the default settings on `aiayn.pdf` (equal to `li-q3-0-6b-hybrid`) can be embedded as a new experiment with a name you type, and afterwards both experiments exist with their own collections and metric rows and the matrix experiment's numbers are unchanged; a second, small PDF (generated for the check) is added to that new experiment through "An existing experiment" and its collection holds both documents; the benchmarked matrix experiment appears in the list with its notice and checkbox and Embed stays disabled until the box is ticked (without embedding into it); a name that is taken is refused; the throwaway experiments are removed afterwards. No new tests beyond the hash test.
+
+**Status: done (2026-10-03).** Checked once on the real stack through Streamlit's app tester, with `aiayn.pdf` and a one-page PDF written by hand for the check:
+- **Hashes:** `matrix.yaml`'s experiments keep their hashes (`q3-0-6b-hybrid` is still `5bd37b6548ff04be`); the new hash test passes (7 tests).
+- **New experiment with the same settings as a matrix one:** `aiayn.pdf` with the default settings (equal to `li-q3-0-6b-hybrid`) was embedded as `p10-new`. The taken name `li-q3-0-6b-hybrid` was refused; `p10-new` was accepted. `p10-new` got hash `afade546c2fa214a` against `41d2696cdcf4b66a` for the matrix experiment, its own collection (41 points) and its own metric rows, and `li-q3-0-6b-hybrid` stayed at 41 points and 4 stage rows.
+- **Adding to an existing experiment:** the second document (a different PDF, same settings) was offered the list `li-q3-0-6b-hybrid · 1 document(s) · 41 points · benchmarked` and `p10-new · 1 document(s) · 41 points`. Choosing the benchmarked one showed the notice and kept Embed disabled until the box was ticked (not embedded). Embedding into `p10-new` took its collection to 42 points; `experiment_summary` showed 2 documents and 42 chunks for it, and searching it found the lantern paragraph (similarity 0.540) and the attention section (0.733) from the same collection.
+- **Dashboard:** after `search_benchmark` was run on `p10-new`, the `llamaindex` view showed the warning that it and `li-q3-0-6b-hybrid` share model, strategy and engine; the `native` view showed none.
+- All of this was removed afterwards (experiment row, metric and benchmark rows, collection, artifacts and uploads).
+
+Changes from the plan, and notes:
+- The overlap notice on the dashboard is a warning box above the tabs, not a caption.
+- In "An existing experiment" the experiment's row is left as it is; only files, stage rows and points are added.
+- The selector shows each experiment's document count (distinct documents in its stage metrics) and point count; an experiment whose collection does not exist yet reads "no collection yet".
+- Experiments from before this phase are matched through their stored hash, not a rebuilt config, so native experiments (no `engine` key in their stored config) are offered correctly.
+- The Phase 9 limitation (settings equal to a benchmarked experiment cannot be embedded) is gone.
+
+Not included: renaming or deleting experiments, keying the `experiments` table by name, and moving a document between experiments.
+
+## Phase 11 — From a benchmark lab to a RAG platform
+
+Goal: the app's main use becomes uploading documents and searching them. The comparison of models and chunkers moves to one dedicated page that takes **one uploaded document**, runs every chosen embedding model × chunking strategy on it, and produces a report you can reopen later and download as a PDF. The old dashboard and its machinery are removed.
+
+Parts of Phases 6, 6a, 7 and 8 describe what is removed here. Those sections stay as the history of how the lab was built; this phase and `CLAUDE.md` describe what is current.
+
+### Decisions (taken 2026-10-03)
+
+| Topic | Decision | Reason |
+|---|---|---|
+| What the report measures | Always: speed and behaviour. Optionally: retrieval quality, when you give test queries. | An uploaded document has no known correct answers. Speed and behaviour need none; quality needs a snippet per query that must appear in the right chunk, as the old query set did. |
+| Clean-out | Everything goes: the code, the benchmark tables and view, and the 30 matrix experiments with their collections, files and rows. | You chose a clean slate. |
+| The report's experiments | Kept and queryable, named `bench-<document>-<run id>-<model>-<strategy>`. Each run has a button that deletes its experiments. | They then show up on "Try a query". A full run is 15 small collections. |
+| Run mode | A background thread in the UI process. Progress and results are saved in Postgres, so closing the tab loses nothing and old reports can be reopened. One run at a time. | A full run takes about ten minutes. |
+| Navigation | Upload (the default page), Try a query, Benchmark. | Upload and search are the platform; Benchmark is a tool. |
+| Try a query | Pick one experiment by name, set top k, search. No model or strategy choices. The text/table content filter stays. | As asked; the content filter was not mentioned, so it is kept and can be dropped. |
+| Report format | The report is built once as data (settings, tables, bar series, notes) and drawn twice: on screen with Streamlit and the existing Altair charts, and as a PDF with `reportlab`. | One new dependency, no browser or image rendering. The stated need is the PDF download. |
+
+### What the benchmark does
+
+For each chosen model (in turn, so each model loads once) and strategy, it runs the same steps the Upload page's Embed button runs, on one parsed document:
+
+1. chunk, embed and index into a new experiment (tagged with its name, so its hash is its own), recording the usual stage rows;
+2. run the **probe queries** against it: about 20 sentences sampled evenly from the document (8 to 40 words, no table or markup lines), the same for every experiment, searched once to warm up and then three times for timing. They give search latency and similarity scores, never quality, and the report says they are sentences from the document, so their scores show how scores are spread, not how well the right chunk is found;
+3. if test queries were given, search them once at the chosen top k and score them with the existing `metrics/retrieval.py` (hit rate, recall, precision, MRR, MAP, nDCG at 1, 3, 5, 10 up to top k), judging a hit by whether its text contains the query's snippet.
+
+| Group | Per experiment |
+|---|---|
+| Chunking | chunk count, text and table counts, token minimum, mean and maximum, chunking seconds, warnings, and for `semantic` the sentence and embedding counts |
+| Embedding | seconds, chunks per second, tokens per second, model load time, vector size |
+| Index | seconds and points |
+| Search (probe queries) | embed, Qdrant and total time (p50, p95, mean), queries per second, cold first query, top-1 similarity (mean, min, max), gap between rank 1 and rank k |
+| Quality (test queries only) | the metrics above, the first relevant rank of each query, and **snippet coverage**: how many snippets appear whole in some chunk of this experiment (a snippet cut by a chunk boundary caps what any model can score, as the Phase 7 coverage check found) |
+
+Similarity scores are never compared across models, as before: the report ranks models on quality and speed only.
+
+### 11.0 Clear out
+
+- [x] Remove code and files: `ui/dashboard.py`; `query_grid` in `ui/charts.py` and the SQL functions in `ui/data.py` (the chart helpers and the model and strategy label helpers stay, the new page uses them); `src/rag_lab/benchmark/`; `src/rag_lab/assets/benchmark.py` (`search_benchmark`, `experiment_summary`) and its entries in `definitions.py`; `src/rag_lab/experiments/` and `experiments/` (both matrices); `eval/queries.yaml`; `src/rag_lab/metrics/summary.py`; `summary()` in `search/quick.py` and its notebook cells (the notebook's examples take an experiment name you set); `BenchmarkConfig`; the `./eval` and `./experiments` mounts in `docker-compose.yml`. Kept for the new benchmark: `metrics/retrieval.py`, `stats.py`, `timing.py`, `tests/test_retrieval.py`, `search()`.
+- [x] Migration `0005_drop_benchmark.sql`: drop `experiment_summary`, `benchmark_metrics`, `query_results`, `benchmark_runs` and `eval_queries`. `experiments`, `ingestion_stage_metrics` and `search_log` stay.
+- [x] Remove the data, once, by hand and not as code: the 15 `q3-*` and 15 `li-*` Qdrant collections and the unused `docs` one; `data/artifacts/q3-*`, `li-*` and `docs`; the rows in `experiments`, `ingestion_stage_metrics` and `search_log` for those experiments; `data/matrix*.log`. `data/artifacts/_cache` (the sentence-embedding cache), `data/raw` and the document files stay. Before this, a few of the 30 queries from `eval/queries.yaml` are copied to the scratch folder to test the new page.
+- [x] Check once: the stack starts, Dagster loads its definitions (parse to index and `ingest_job` remain), the tests pass, and the app starts with only the pages that still exist.
+
+### 11.1 Try a query
+
+- [x] `ui/query.py` is rewritten: a selector over the experiments that have a Qdrant collection (each shown as `name · model · strategy · documents · points`), a top-k slider (default 5), the content filter, and a Search button. Results are one list of hit cards (rank, similarity bar, modality, page, headings, snippet, full text) with the embed and search times; the cross-experiment columns, agreement badges and expected-entry lines go. The query is embedded with the selected experiment's own settings through `search()`. Nothing is written to `search_log`. With no experiment the page says to upload a document first.
+
+### 11.2 Shared pieces
+
+- [x] `ingest.py`: `ensure_parsed(path, doc_id)` (the cached Docling parse that the Upload page does today) and `ingest_document(...)`, the Embed button's steps (copy the parse files, write the chunks, register the experiment, record parse and chunk, embed, index). The Upload page calls both, so it keeps its behaviour, and the benchmark runner calls them too.
+
+### 11.3 Benchmark storage
+
+- [x] Migration `0006_benchmark_reports.sql`:
+  - `benchmark_reports`: `report_id`, `document_id`, `document_name`, `status` (`running`, `done`, `failed`, `stopped`, `interrupted`), `settings` (models, strategies, engine, shared chunk settings, top k, repeats, probe count), `test_queries` (null or a list of query and snippet), `probes`, `document_info` (pages, tables, parse seconds, characters per page), `total_experiments`, `stop_requested`, `error`, `created_at`, `updated_at`, `finished_at`.
+  - `benchmark_results`: `report_id` (cascading delete), `experiment`, `model`, `strategy`, `status` (`done` or `failed`), `metrics` (jsonb, the table above), `per_query` (jsonb, null without test queries), `error`, `created_at`; primary key `(report_id, experiment)`.
+  Results are read whole into one report, so one jsonb per experiment replaces the old one-row-per-metric layout.
+- [x] `MetricsStore` methods for them: create a report, save a result, update status and `updated_at`, request a stop, list and load reports.
+
+### 11.4 Benchmark runner
+
+- [x] `src/rag_lab/benchmark/` again, plain Python, no Dagster or Streamlit: `probe_queries(reference_text, n)`; `snippet_coverage(chunks, snippets)`; `run_report(report_id, ...)` with the steps above. It saves each experiment's result as soon as it is done, updates `updated_at` at every step, checks `stop_requested` between experiments, records a failed experiment with its error and goes on, and ends with `done`, `stopped` or `failed`.
+- [x] Reuses `search()`, `latency_summary`, `timed` and `metrics/retrieval.py`. Parsing happens once (`ensure_parsed`), not per experiment.
+
+### 11.5 The Benchmark page
+
+- [x] `ui/benchmark.py`, third in the navigation. A document: upload a PDF, or use the one already uploaded on the Upload page. Settings: models (the Qwen3 models Ollama has, all by default), strategies (all five), engine (`llamaindex` by default), `max_tokens`, overlap (for `fixed`), table handling, headings, top k and probe count. Test queries in `st.data_editor` (a query column and a "text that must be in the right chunk" column; empty rows ignored), with a warning for any snippet that is not in the document at all (the silent-zero trap from Phase 7.1). The number of experiments is shown before the Start button.
+- [x] **Start** begins the run in a background thread kept in a module-level registry (so a rerun of the script does not lose it) and refuses to start when one is running. While it runs the page refreshes itself every few seconds with `st.fragment`: experiment `n` of `N`, the current step, a table of the finished ones, and a **Stop after this experiment** button. A report still `running` whose `updated_at` is older than 15 minutes is shown as `interrupted` (the UI container restarted).
+- [x] A list of previous reports (document, date, status, experiment count) to reopen. Each report has **Delete this run's experiments** (collections, `data/artifacts/<name>`, experiments and stage rows); the report itself stays.
+
+### 11.6 The report and the PDF
+
+- [x] `rag_lab/benchmark/report.py` builds the report as plain data from the saved rows: the document and settings, a summary table (one row per model and strategy: chunks, mean tokens, embedding tokens per second, search p50, and with test queries recall@5, MRR and nDCG@5 plus snippet coverage), series for the charts, the per-query table, failed experiments, and the notes ("scores are not comparable across models", "probe queries are sentences from the document", the snippet-coverage caveat).
+- [x] On screen: the summary table and the existing grouped-bar and heatmap charts (`ui/charts.py`) for speed, chunk counts and, with test queries, quality; the per-query table; the notes.
+- [x] `rag_lab/benchmark/pdf.py` draws the same data with `reportlab` (a title block, the settings, the summary table with the best value of each column marked, bar charts from `reportlab.graphics`, the per-query table, the notes) and returns bytes; `st.download_button` names the file `benchmark-<document>-<date>.pdf`. `reportlab` is added to `pyproject.toml` and the image rebuilt once. Its standard fonts only cover Latin-1, so other characters in a document name are replaced with `?` in the PDF.
+
+### 11.7 Navigation and docs
+
+- [x] `ui/app.py`: Upload (default), Try a query, Benchmark. The Upload page's heading now describes the platform: upload, chunk, embed, then search.
+- [x] `CLAUDE.md` is rewritten for what the project now is (a RAG platform with a benchmark tool), without the matrix, query-set, summary-view and `li-` comparison facts; this section of `PLAN.md` gets the status and the numbers.
+
+Done when, checked once on the real stack (Streamlit's app tester for the pages, Docker for the rest): the clean-out check above passes; "Try a query" lists an experiment made on the Upload page and searches only it; a benchmark of `aiayn.pdf` with the 0.6b model and all five strategies, five test queries from the old set and the default probes runs in the background, keeps running when the page object is discarded and recreated, and ends as `done` with a report that shows the speed and quality sections; the PDF downloads, is rendered to images with `pypdfium2` and looked at; stopping a run after one experiment ends it as `stopped`; deleting the run's experiments removes their collections; and the whole run's experiments and rows are cleaned up afterwards. No new test files: nothing here is retrieval-metric, truncation or hashing logic, and the metric formulas keep their existing test.
+
+**Status: done (2026-10-03).** Checked on the real stack with `aiayn.pdf`; the pages were driven with Streamlit's app tester, and the runs, the PDF and the clean-out were checked against Postgres, Qdrant and the rendered PDF.
+- **Clean-out:** the code and files in 11.0 are gone, migrations `0005` and `0006` are applied, and 31 Qdrant collections (the 15 `q3-*`, the 15 `li-*` and `docs`), their artifact folders, 30 `experiments` rows (their stage rows went with them) and the matrix logs were removed. One older test experiment, `full-ingest-test` (a collection and four stage rows from an early phase, not one of the 30), was left. The stack starts, Dagster loads its definitions (the four assets, `ingest_job` and the sensor), the 7 tests pass, and the app has the three pages.
+- **Try a query:** it lists the experiments that have a collection with `name · model · strategy · documents · points`; searching a benchmark experiment returned 5 chunks (embed 208 ms, search 4 ms).
+- **Benchmark runs:** (1) `aiayn.pdf`, the 0.6b model and all five strategies, started from the page, ran in the background thread and finished in 36 s with the page object discarded after Start (the thread kept going and the report ended as `done`). (2) The 0.6b and 4b models with `hybrid`, `fixed` and `recursive`, 7 test queries (5 text, 2 table, from the old set) and the default probes: 6 of 6 done in 52 s.
+
+  | Model | Strategy | Chunks | Embed tokens/s | Search p50 | Snippet coverage | MRR | nDCG@5 |
+  |---|---|---|---|---|---|---|---|
+  | 0.6b | hybrid | 41 | 6587 | 28 ms | 1.00 | 0.929 | 0.947 |
+  | 0.6b | fixed | 45 | 7107 | 32 ms | 1.00 | 0.929 | 0.947 |
+  | 0.6b | recursive | 44 | 7033 | 30 ms | 1.00 | 0.929 | 0.947 |
+  | 4b | hybrid | 41 | 1438 | 45 ms | 1.00 | 0.810 | 0.857 |
+  | 4b | fixed | 45 | 2355 | 44 ms | 1.00 | 0.857 | 0.895 |
+  | 4b | recursive | 44 | 2330 | 47 ms | 1.00 | 0.857 | 0.895 |
+
+  Seven queries is a small sample (one query moves MRR by about 0.1 here), so this table checks that the report works, not which model is better.
+- **While running and after:** the page loaded during a run shows the progress panel and a Stop button without errors and, once the run has ended, shows no progress panel. A run stopped after its first experiment ended as `stopped` with 2 of 3 results (one more experiment was already under way when the stop was requested; a stop takes effect between experiments). "Delete this run's experiments" removed all five collections and left the report, which still opened.
+- **The PDF:** four pages (landscape A4), rendered to images with `pypdfium2` and looked at: document facts, settings, a summary table with the best values marked green, five bar charts (embedding speed, search latency, chunks, nDCG@5, MRR; value labels, one colour per model), the test-query rank table and the notes. The first render showed the chart legend overlapping the axis labels, tables centred instead of left-aligned and the "Charts" heading alone at the foot of a page; all three were fixed and the second render was checked.
+- **Everything the checks made was removed**: the reports, their experiments, collections, artifacts, uploads and the files written for the checks.
+
+Changes from the plan, and notes:
+- **Not verified:** how the pages look in a browser (the colours and layout in `style.py` and the charts on the Benchmark page), the every-3-seconds refresh of the progress panel (the app tester runs a fragment once), and the "interrupted after 15 minutes" rule (no container was restarted mid-run). The app tester counted no chart elements on the report view although the page rendered without an exception.
+- The app tester resets `st.data_editor` after the run in which its state was set, so the first benchmark above ran without test queries; the second set the state in the run that clicked Start. This is a test-tool limit, not a page fault.
+- `ui/data.py` keeps only `frame`, the model and strategy labels and ordering, and `embedding_models()` (now shared by Upload and Benchmark). `ingest.py` gained `save_upload`, `ensure_parsed` and `ingest_document`, which the Upload page now calls too; its Embed behaviour is unchanged (an experiment in a benchmark report now shows "in a benchmark report" in its selector and the notice says its report is not redone).
+- `Services` bundles the metrics store, embedder and Qdrant store for the runner thread; `CURRENT_STEP` (this process only) holds what each running report is doing for the progress line.
+- The report row's `stop_requested` and heartbeat are in Postgres, so a second browser tab sees the same state; the thread registry itself is per process.
+- The PDF uses Latin-1 fonts only (other characters in names become `?`), as planned and left open.
+
+Not included: running the benchmark on several documents at once, generating test queries with an LLM, benchmarks of other parameters than model and strategy (the shared settings are fixed per run), sharing or exporting reports other than the PDF, and filtering "Try a query" by document.
+
 ## Ideas
 
 Not planned and not in any phase. Each is built only when you ask for it.
+
+- On the upload page: parse options (`table_mode`, formulas), and picking a document already in `data/raw`.
+- Parsing for the upload page as a Dagster run (a partition and `parsed_document`) instead of inside the Streamlit process, so it shows in the Dagster UI and does not use the UI container's memory.
+
+- One `IngestionPipeline` with a docstore, to skip unchanged documents and dedupe chunks (see Phase 8; it conflicts with per-stage files, so it would be a separate fast path).
 
 - Reuse one parse across experiments instead of re-parsing for each (copy or point to the parse output, and copy its metrics row).
 - A fixed-dimension axis in the matrix (all models truncated to the same size by Matryoshka) to separate model quality from vector size.
@@ -424,4 +811,13 @@ Not planned and not in any phase. Each is built only when you ask for it.
 | The 8b embedding model does not fit the Mac's memory, or Ollama swaps models and distorts latency | Check memory in Phase 7.1; the matrix runs model by model so each is loaded once; `model_load_ms` is recorded per experiment. |
 | Models are ranked by similarity scores, which differ in scale between models | The dashboard compares models on recall, MRR and nDCG only; the plan requires a filled-in query set before the comparison run. |
 | Qdrant data corruption from a Windows bind mount | Qdrant storage uses a Docker named volume only. |
+| LlamaIndex dependencies do not resolve next to Docling, or its API moves | Check with one image rebuild in 8.0; the packages' own ranges are `llama-index-core<0.15`, `numpy>=2`, `qdrant-client>=1.16`, so pin the four packages to the versions that were checked. |
+| Docling in the Streamlit container uses a lot of memory and blocks that user's session while it parses | Parse once per document and cache it; show progress in `st.status`; the model cache volume is shared with `dagster-code`. If Docker Desktop's memory limit is hit, parsing for the page can move to a Dagster run (Ideas). |
+| A benchmark thread dies with the UI container, or competes with a person using the app for CPU and Ollama | Results are saved per experiment, a stale `running` report shows as `interrupted`, one run at a time, models run in turn so each loads once, and a Stop button ends a run between experiments. |
+| Probe queries are sentences of the document, so their similarity scores look better than real questions would | They are used for latency and score spread only; the report says so, and quality comes only from the test queries. |
+| A test snippet is cut by a chunk boundary, so a chunker scores low for a reason unrelated to retrieval | Snippet coverage is reported per experiment next to the quality numbers, and snippets absent from the document are flagged before the run. |
+| A chunk's span is wrong, so cut marks sit in the wrong place without any error | The one-off check over `aiayn.pdf` in Phase 9 compares the text inside every span with the chunk's body; the page labels the approximate cases (tables, split paragraphs) instead of drawing them as exact. |
+| An upload's experiment name or settings collide with a matrix experiment | The name and hash checks in Phase 9 refuse them before anything is written. |
+| LlamaIndex's sentence splitter needs NLTK data downloaded at first use | `NLTK_DATA` points into the `model_cache` volume (8.0); the first run needs internet. |
+| LlamaIndex splitters differ from our own, so `llamaindex` experiments are not chunk-for-chunk identical | The comparison in 8.4 decides; the differences are listed in 8.2 and `native` stays until you retire it. |
 | Wiping the Postgres volume loses metrics history along with Dagster's run history | Both live in one volume; `docker compose down -v` is called out in `CLAUDE.md`. Add a `pg_dump` script if the history starts to matter. |

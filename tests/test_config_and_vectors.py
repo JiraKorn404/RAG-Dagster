@@ -24,6 +24,25 @@ def test_config_hash_ignores_settings_of_unused_strategies():
     ).config_hash()
 
 
+def test_config_hash_tells_engines_apart_and_defaults_to_llamaindex():
+    default = ExperimentConfig(name="a")
+    assert default.config_hash() == ExperimentConfig(
+        name="a", chunk=ChunkConfig(engine="llamaindex")
+    ).config_hash()
+    assert default.config_hash() != ExperimentConfig(
+        name="a", chunk=ChunkConfig(engine="native")
+    ).config_hash()
+
+
+def test_tag_changes_the_hash_only_when_set_and_never_the_settings_hash():
+    plain = ExperimentConfig(name="a")
+    assert ExperimentConfig(name="a", tag=None).config_hash() == plain.config_hash()
+    tagged = ExperimentConfig(name="a", tag="a")
+    assert tagged.config_hash() != plain.config_hash()
+    assert ExperimentConfig(name="b", tag="b").config_hash() != tagged.config_hash()
+    assert tagged.settings_hash() == plain.settings_hash() == plain.config_hash()
+
+
 def test_truncate_keeps_dimension_and_unit_length():
     out = truncate_and_normalise([[3.0, 4.0, 12.0, 0.5]], 2)[0]
     assert len(out) == 2

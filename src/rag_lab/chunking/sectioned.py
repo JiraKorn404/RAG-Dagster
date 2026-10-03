@@ -16,31 +16,54 @@ def chunk_sections(ctx: ChunkContext, splitter: Splitter) -> list[Chunk]:
     strategy = cfg.strategy
     chunks: list[Chunk] = []
     for block in segment(ctx.doc):
-        prefix = "\n".join(block.headings) + "\n" if cfg.include_headings_in_text and block.headings else ""
-        # Headings are part of the embedded text, so they use up part of the budget (but never more
-        # than half of it, so a very long heading cannot starve the body).
-        budget = max(cfg.max_tokens - ctx.tokens.count(prefix), cfg.max_tokens // 2) if prefix else cfg.max_tokens
+        prefix, budget = prefix_and_budget(ctx, block.headings)
 
         if isinstance(block, TableBlock):
-            if cfg.table_handling == "skip":
-                continue
-            for text in _table_texts(ctx, block, budget):
-                chunks.append(
-                    Chunk(ctx.doc_id, prefix + text, "table", strategy, block.page, block.headings, block.bbox)
-                )
+            if cfg.table_handling != "skip":
+                chunks.extend(table_chunks(ctx, block))
             continue
 
         for start, end in splitter(block.text, budget, ctx):
-            body = block.text[start:end].strip()
+            piece = block.text[start:end]
+            body = piece.strip()
             if body:
-                para = block.locate(start)
+                para = block.locate(start)  # of the cut itself, so pages stay as they were
+                start += len(piece) - len(piece.lstrip())
                 chunks.append(
-                    Chunk(ctx.doc_id, prefix + body, "text", strategy, para.page, block.headings, para.bbox)
+                    Chunk(
+                        ctx.doc_id, prefix + body, "text", strategy, para.page, block.headings, para.bbox,
+                        span=[block.offset + start, block.offset + start + len(body)],
+                    )
                 )
     return chunks
 
 
-def _table_texts(ctx: ChunkContext, block: TableBlock, budget: int) -> list[str]:
+def table_chunks(ctx: ChunkContext, block: TableBlock) -> list[Chunk]:
+    """The chunks of one table. Their span is the whole table, which is exact when the table is one
+    chunk and an approximation when it was split by rows or into one chunk per row."""
+    prefix, budget = prefix_and_budget(ctx, block.headings)
+    texts = table_texts(ctx, block, budget)
+    span = [block.offset, block.offset + len(block.markdown)]
+    return [
+        Chunk(
+            ctx.doc_id, prefix + text, "table", ctx.cfg.chunk.strategy, block.page, block.headings,
+            block.bbox, span=list(span), span_approx=len(texts) > 1,
+        )
+        for text in texts
+    ]
+
+
+def prefix_and_budget(ctx: ChunkContext, headings: list[str]) -> tuple[str, int]:
+    """The heading text embedded before a chunk, and the token budget that is left for its body."""
+    cfg = ctx.cfg.chunk
+    prefix = "\n".join(headings) + "\n" if cfg.include_headings_in_text and headings else ""
+    # Headings are part of the embedded text, so they use up part of the budget (but never more
+    # than half of it, so a very long heading cannot starve the body).
+    budget = max(cfg.max_tokens - ctx.tokens.count(prefix), cfg.max_tokens // 2) if prefix else cfg.max_tokens
+    return prefix, budget
+
+
+def table_texts(ctx: ChunkContext, block: TableBlock, budget: int) -> list[str]:
     if ctx.cfg.chunk.table_handling == "row-wise":
         df = block.item.export_to_dataframe(doc=ctx.doc)
         rows = [
@@ -50,7 +73,7 @@ def _table_texts(ctx: ChunkContext, block: TableBlock, budget: int) -> list[str]
         rows = [r for r in rows if r]
         if rows:
             return rows
-    markdown = block.item.export_to_markdown(doc=ctx.doc)
+    markdown = block.markdown
     if ctx.tokens.count(markdown) <= budget:
         return [markdown]
     return _split_markdown_table(markdown, budget, ctx)

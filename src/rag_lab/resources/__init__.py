@@ -24,10 +24,16 @@ class ExperimentResource(ConfigurableResource):
     chunk: ChunkConfig = ChunkConfig()
     embed: EmbedConfig = EmbedConfig()
     index: IndexConfig = IndexConfig()
+    tag: str | None = None  # set for an experiment made on the Upload page: its hash includes it
 
     def config(self) -> ExperimentConfig:
         return ExperimentConfig(
-            name=self.name, parse=self.parse, chunk=self.chunk, embed=self.embed, index=self.index
+            name=self.name,
+            parse=self.parse,
+            chunk=self.chunk,
+            embed=self.embed,
+            index=self.index,
+            tag=self.tag,
         )
 
 

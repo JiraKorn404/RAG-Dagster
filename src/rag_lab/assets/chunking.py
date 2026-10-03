@@ -7,6 +7,7 @@ from rag_lab.assets.parsing import parsed_document
 from rag_lab.assets.partitions import documents_partitions
 from rag_lab.chunking import chunk_document, summarise
 from rag_lab.chunking.models import write_chunks
+from rag_lab.ingest import record_chunk, register_experiment
 from rag_lab.paths import artifacts_dir
 from rag_lab.resources import ExperimentResource, MetricsStoreResource, OllamaResource
 
@@ -30,8 +31,7 @@ def chunks(
         )
 
     store = metrics.store()
-    config_hash = config.config_hash()
-    store.upsert_experiment(config_hash, config.name, config.model_dump(mode="json"))
+    register_experiment(store, config)
 
     doc = DoclingDocument.load_from_json(parsed_path)
     embedder = ollama.embedder() if config.chunk.strategy == "semantic" else None
@@ -48,21 +48,13 @@ def chunks(
     summary = summarise(result)
     sample = result[0]
 
-    store.add_stage_metric(
-        config_hash,
-        doc_id,
-        "chunk",
-        duration_ms=seconds * 1000,
-        items=summary["chunks"],
-        throughput=summary["chunks"] / seconds if seconds else None,
-        details={"strategy": config.chunk.strategy, **summary, **ctx.stats, "warnings": ctx.warnings},
-        dagster_run_id=context.run_id,
-    )
+    record_chunk(store, config, doc_id, summary, ctx.stats, ctx.warnings, seconds, context.run_id)
 
     return MaterializeResult(
         metadata={
             "experiment": config.name,
             "strategy": config.chunk.strategy,
+            "engine": config.chunk.engine,
             "chunks": summary["chunks"],
             "by_modality": MetadataValue.json(summary["by_modality"]),
             "tokens_min": summary["tokens_min"],

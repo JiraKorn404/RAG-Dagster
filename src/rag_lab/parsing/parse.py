@@ -1,6 +1,6 @@
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
@@ -11,6 +11,8 @@ from docling.datamodel.pipeline_options import (
     TableStructureOptions,
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling_core.types.doc import DoclingDocument
+from llama_index.readers.docling import DoclingReader
 
 from rag_lab.config import ParseConfig
 
@@ -19,7 +21,7 @@ from rag_lab.config import ParseConfig
 class ParsedDocument:
     doc_id: str
     source_file: str
-    status: str  # success | partial_success | failure
+    status: str  # always "success": DoclingReader raises when Docling fails, and hides partial_success
     pages: int = 0
     tables: int = 0
     table_cells: int = 0
@@ -30,7 +32,6 @@ class ParsedDocument:
     model_load_seconds: float = 0.0
     parse_seconds: float = 0.0
     pages_per_second: float = 0.0
-    errors: list[str] = field(default_factory=list)
     markdown_preview: str = ""
 
 
@@ -59,30 +60,33 @@ def build_converter(cfg: ParseConfig) -> DocumentConverter:
 
 
 def parse_pdf(path: Path, doc_id: str, cfg: ParseConfig, out_dir: Path) -> ParsedDocument:
-    """Parse one PDF and write <doc_id>.json (Docling document), <doc_id>.md and <doc_id>.meta.json."""
+    """Parse one PDF with LlamaIndex's DoclingReader (our converter inside) and write <doc_id>.json
+    (Docling document), <doc_id>.md and <doc_id>.meta.json. Raises if Docling fails."""
     t0 = time.perf_counter()
     converter = build_converter(cfg)
     converter.initialize_pipeline(InputFormat.PDF)  # loads the models, so parse time excludes it
     model_load_seconds = time.perf_counter() - t0
 
+    def document_id(doc: DoclingDocument, file_path: str | Path) -> str:
+        return doc_id  # the reader's Document id is our content-hash id, so Qdrant's `doc_id` matches
+
+    reader = DoclingReader(
+        export_type=DoclingReader.ExportType.JSON, doc_converter=converter, id_func=document_id
+    )
     t1 = time.perf_counter()
-    result = converter.convert(path, raises_on_error=False)
+    (li_doc,) = reader.load_data(path)
     parse_seconds = time.perf_counter() - t1
 
+    doc = DoclingDocument.model_validate_json(li_doc.text)
+    markdown = doc.export_to_markdown()
+    text_chars = sum(len(t.text) for t in doc.texts)
     parsed = ParsedDocument(
         doc_id=doc_id,
         source_file=path.name,
-        status=result.status.value,
+        status="success",
         model_load_seconds=round(model_load_seconds, 3),
         parse_seconds=round(parse_seconds, 3),
-        errors=[str(e.error_message) for e in result.errors],
     )
-    if parsed.status == "failure":
-        return parsed
-
-    doc = result.document
-    markdown = doc.export_to_markdown()
-    text_chars = sum(len(t.text) for t in doc.texts)
     parsed.pages = len(doc.pages)
     parsed.tables = len(doc.tables)
     parsed.table_cells = sum(len(t.data.table_cells) for t in doc.tables)

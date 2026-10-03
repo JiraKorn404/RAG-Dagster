@@ -90,6 +90,38 @@ button[data-baseweb="tab"] {{ font-weight: 600; }}
   border-radius: 8px; padding: 8px; margin-top: 6px;
 }}
 .hit code {{ font-size: .74rem; color: #9ec5f4; }}
+
+.doc {{
+  background: {PAGE}; border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 14px 16px;
+  white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: .86rem; color: {INK};
+  max-height: 72vh; overflow-y: auto;
+}}
+.doc .gap {{ color: {MUTED}; }}
+.doc .c0 {{ background: rgba(57,135,229,.18); }}
+.doc .c1 {{ background: rgba(25,158,112,.18); }}
+.doc .ov {{ background: rgba(201,133,0,.42); }}
+.doc .ap {{ background: rgba(255,255,255,.06); outline: 1px dashed rgba(255,255,255,.30); }}
+.doc .cut {{
+  display: inline-block; font-size: .68rem; font-weight: 700; color: {INK}; background: {GRID};
+  border-radius: 6px; padding: 0 7px; margin: 0 5px 0 2px; white-space: nowrap; vertical-align: 1px;
+  border-left: 3px solid #3987e5;
+}}
+.doc .cut-1 {{ border-left-color: #199e70; }}
+.doc .cut-ov {{ border-left-color: #c98500; }}
+.doc .cut-ap {{ border-left-color: #c3c2b7; }}
+.doc .cut-none {{ border-left-color: {MUTED}; color: {MUTED}; }}
+.doc-keys {{ display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 .6rem 0; font-size: .78rem; color: {INK_2}; }}
+.doc-key span {{ border-radius: 3px; }}
+.doc-key .c0 {{ background: rgba(57,135,229,.18); }}
+.doc-key .c1 {{ background: rgba(25,158,112,.18); }}
+.doc-key .ov {{ background: rgba(201,133,0,.42); }}
+.doc-key .ap {{ background: rgba(255,255,255,.06); outline: 1px dashed rgba(255,255,255,.30); }}
+.doc-key .gap {{ background: {GRID}; }}
+.hit pre.chunktext {{
+  white-space: pre-wrap; word-break: break-word; margin: 6px 0 0 0; padding: 0; background: transparent;
+  color: {INK_2}; font-size: .82rem; line-height: 1.45; font-family: inherit;
+}}
+.hit .dim {{ color: {MUTED}; }}
 </style>
 """
 

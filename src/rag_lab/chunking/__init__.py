@@ -5,6 +5,7 @@ from docling_core.types.doc import DoclingDocument
 
 from rag_lab.chunking import fixed, native, recursive, semantic  # noqa: F401  (register strategies)
 from rag_lab.chunking.base import REGISTRY, ChunkContext
+from rag_lab.chunking.llamaindex import chunk_llamaindex
 from rag_lab.chunking.models import Chunk
 from rag_lab.chunking.tokens import load_tokenizer
 from rag_lab.config import ExperimentConfig
@@ -21,7 +22,7 @@ def chunk_document(
     if cfg.chunk.overlap and strategy != "fixed":
         ctx.warnings.append(f"overlap is only used by 'fixed'; ignored for '{strategy}'")
 
-    chunks = REGISTRY[strategy](ctx)
+    chunks = chunk_llamaindex(ctx) if cfg.chunk.engine == "llamaindex" else REGISTRY[strategy](ctx)
     for i, chunk in enumerate(chunks):
         chunk.chunk_id = f"{doc_id}:{i:05d}"
         chunk.token_count = ctx.tokens.count(chunk.text)

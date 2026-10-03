@@ -8,6 +8,9 @@ from dagster import Config
 from pydantic import ConfigDict, Field
 
 
+NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+
+
 # Config is a pydantic model, so these also work as Dagster run config (the launchpad form)
 # without a second definition. Stage code only needs the models, not Dagster's runtime.
 class _Section(Config):
@@ -47,6 +50,10 @@ class SemanticSettings(_Section):
 
 
 class ChunkConfig(_Section):
+    # Which implementation runs the strategy. `llamaindex` uses LlamaIndex's splitters, which differ
+    # from ours in a few settings (see chunking/llamaindex.py); `native` is the original code. A config
+    # that does not say is `llamaindex`, so experiments run before the default changed need `native`.
+    engine: Literal["native", "llamaindex"] = "llamaindex"
     strategy: Literal["hybrid", "hierarchical", "fixed", "recursive", "semantic"] = "hybrid"
     max_tokens: int = 512
     overlap: int = 0  # tokens; only the `fixed` strategy uses it
@@ -77,31 +84,39 @@ class IndexConfig(_Section):
     hnsw_ef: int | None = None  # search-time ef; None uses the Qdrant default
 
 
-class BenchmarkConfig(_Section):
-    """Settings of one search benchmark run. Not part of the experiment, so not in the config hash."""
-
-    top_k: int = 10  # quality metrics are computed for k in 1, 3, 5, 10 up to this value
-    repeats: int = 5  # timed passes over the query set, after one warm-up pass
-    queries_file: str = "eval/queries.yaml"
-
-
 class ExperimentConfig(_Section):
     # The name doubles as the Qdrant collection name, so keep it simple.
-    name: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    name: str = Field(pattern=NAME_PATTERN)
     parse: ParseConfig = ParseConfig()
     chunk: ChunkConfig = ChunkConfig()
     embed: EmbedConfig = EmbedConfig()
     index: IndexConfig = IndexConfig()
+    # When set, part of the config hash, so the same settings under another tag are a separate
+    # experiment (the Upload page tags the experiments it creates with their name). Empty is left out
+    # of the hash, which keeps every hash from before `tag` existed.
+    tag: str | None = None
 
     @property
     def collection(self) -> str:
         return self.name
 
     def config_hash(self) -> str:
-        """Identifies the settings, not the name: the same settings under two names share a hash."""
+        """Identifies the experiment: its settings and its tag, not its name. Experiments without a tag
+        and with the same settings share a hash."""
+        return self._hash(with_tag=True)
+
+    def settings_hash(self) -> str:
+        """Identifies the settings alone: the same for every name and tag."""
+        return self._hash(with_tag=False)
+
+    def _hash(self, with_tag: bool) -> str:
         data = self.model_dump(mode="json", exclude={"name"})
         for strategy in ("hybrid", "recursive", "semantic"):
             if strategy != self.chunk.strategy:
                 data["chunk"].pop(strategy)  # unused strategy settings do not identify the experiment
+        if self.chunk.engine == "native":
+            data["chunk"].pop("engine")  # keeps the hashes of the experiments run before `engine` existed
+        if not (with_tag and self.tag):
+            data.pop("tag")
         payload = json.dumps(data, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]

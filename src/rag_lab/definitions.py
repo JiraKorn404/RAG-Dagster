@@ -1,6 +1,5 @@
 from dagster import Definitions, EnvVar
 
-from rag_lab.assets.benchmark import experiment_summary, search_benchmark
 from rag_lab.assets.chunking import chunks
 from rag_lab.assets.indexing import embeddings, qdrant_index
 from rag_lab.assets.jobs import ingest_job
@@ -14,9 +13,7 @@ from rag_lab.resources import (
 )
 
 defs = Definitions(
-    assets=[
-        parsed_document, chunks, embeddings, qdrant_index, search_benchmark, experiment_summary
-    ],
+    assets=[parsed_document, chunks, embeddings, qdrant_index],
     jobs=[ingest_job],
     sensors=[new_pdf_sensor],
     resources={

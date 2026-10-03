@@ -14,6 +14,10 @@ class Chunk:
     bbox: list[float] | None = None  # [left, top, right, bottom] of the first element, PDF points
     token_count: int = 0
     chunk_id: str = ""  # f"{doc_id}:{index}", assigned once the document's chunks are final
+    # [start, end] in the reference text (chunking/segment.py: reference_text), for the upload page's
+    # preview. An empty span (start == end) means the chunk has no source text. Not stored in Qdrant.
+    span: list[int] | None = None
+    span_approx: bool = False  # the span is the region the chunk came from, wider than the chunk
 
 
 def write_chunks(chunks: list[Chunk], path: Path) -> None:

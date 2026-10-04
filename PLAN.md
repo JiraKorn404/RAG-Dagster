@@ -1,8 +1,8 @@
 # Plan
 
-Nothing is planned right now. Phases 0 to 12 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
+Nothing is planned right now. Phases 0 to 13 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that compares embedding models, chunking strategies and search strategies (dense, hybrid, reranked) and produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
 
-A new phase is written here as `## Phase 13 — ...`: a goal, a table of decisions, numbered steps with checkboxes, and a "Done when" line that is checked once on the real stack. When it is done, its section moves to `COMPLETED_PLAN.md`.
+A new phase is written here as `## Phase 14 — ...`: a goal, a table of decisions, numbered steps with checkboxes, and a "Done when" line that is checked once on the real stack. When it is done, its section moves to `COMPLETED_PLAN.md`.
 
 ## Working approach
 
@@ -31,9 +31,8 @@ Not planned and not in any phase. Each is built only when you ask for it.
 - Parsing for the upload page as a Dagster run (a partition and `parsed_document`) instead of inside the Streamlit process, so it shows in the Dagster UI and does not use the UI container's memory.
 - One `IngestionPipeline` with a docstore, to skip unchanged documents and dedupe chunks (see Phase 8 in `COMPLETED_PLAN.md`; it conflicts with per-stage files, so it would be a separate fast path).
 - Embedding models outside the Qwen3 family.
-- Reranking stage.
 - Quantisation settings in Qdrant.
-- `--exact` search to measure what HNSW gives up, and hybrid (dense plus BM25) search. See Phase 5 in `COMPLETED_PLAN.md`.
+- `--exact` search to measure what HNSW gives up. See Phase 5 in `COMPLETED_PLAN.md`.
 - `docling-serve` as a separate container, compared against in-process parsing.
 
 ## Deferred

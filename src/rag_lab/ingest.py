@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from rag_lab.chunking.models import Chunk, read_chunks, write_chunks
 from rag_lab.config import NAME_PATTERN, ExperimentConfig, ParseConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
+from rag_lab.embedding.sparse import document_vectors
 from rag_lab.metrics.store import MetricsStore
 from rag_lab.parsing.parse import ParsedDocument, parse_pdf
 from rag_lab.paths import DATA_DIR, artifacts_dir
@@ -318,6 +319,13 @@ def index_chunks(
     t1 = time.perf_counter()
     written = len(vector_store.add(nodes))
     upsert_seconds = time.perf_counter() - t1
+    sparse_seconds = 0.0
+    if config.index.sparse:
+        t2 = time.perf_counter()
+        qdrant.add_sparse(
+            collection, [to_point_id(c.chunk_id) for c in rows], document_vectors([c.text for c in rows])
+        )
+        sparse_seconds = time.perf_counter() - t2
     total = qdrant.count(collection)
 
     # A failed batch raises out of add, so there is no partial-failure count to report.
@@ -329,6 +337,8 @@ def index_chunks(
         "setup_and_delete_ms": round((t1 - t0) * 1000, 1),
         "collection_points": total,
     }
+    if config.index.sparse:
+        details["sparse_ms"] = round(sparse_seconds * 1000, 1)
     store.add_stage_metric(
         config_hash,
         doc_id,

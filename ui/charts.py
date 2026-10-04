@@ -56,8 +56,9 @@ def heatmap(df: pd.DataFrame, fmt: str = ".3f", height: int = 300) -> None:
     _finish(cells + labels, height)
 
 
-def grouped_bars(df: pd.DataFrame, unit: str, fmt: str = ".3f", height: int = 300) -> None:
-    """Strategies on the x axis, one bar per model, in the model's colour."""
+def grouped_bars(df: pd.DataFrame, unit: str, fmt: str = ".3f", height: int = 300, order: list[str] | None = None) -> None:
+    """Strategies on the x axis, one bar per model, in the model's colour. `order` is the x axis order when
+    the x values are not chunking strategies (the search strategies, for example)."""
     p = style.palette()
     models = model_order(df["model"])
     colors = p["models"][: len(models)]
@@ -67,7 +68,7 @@ def grouped_bars(df: pd.DataFrame, unit: str, fmt: str = ".3f", height: int = 30
             cornerRadiusTopLeft=4, cornerRadiusTopRight=4, stroke=p["surface"], strokeWidth=2
         )
         .encode(
-            x=alt.X("strategy:N", sort=strategy_order(df["strategy"]), title=None, axis=alt.Axis(labelAngle=0)),
+            x=alt.X("strategy:N", sort=order or strategy_order(df["strategy"]), title=None, axis=alt.Axis(labelAngle=0)),
             xOffset=alt.XOffset("model:N", sort=models),
             y=alt.Y("value:Q", title=unit),
             color=alt.Color(

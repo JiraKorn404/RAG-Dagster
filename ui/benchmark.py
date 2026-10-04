@@ -24,15 +24,17 @@ from rag_lab.benchmark.runner import (
     Services,
     TestQuery,
     delete_report_experiments,
+    result_searches,
     run_report,
     snippets_missing_from,
     start_report,
 )
 from rag_lab.chunking.segment import reference_text, segment
-from rag_lab.config import EmbedConfig
+from rag_lab.config import SEARCH_METHODS, EmbedConfig, SearchConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.ingest import ensure_parsed, save_upload
 from rag_lab.metrics.store import MetricsStore
+from rag_lab.reranking import OllamaReranker
 from rag_lab.storage.qdrant import QdrantStore
 
 STRATEGIES = data.STRATEGIES
@@ -45,6 +47,7 @@ def services() -> Services:
         MetricsStore(os.environ["METRICS_DATABASE_URL"]),
         OllamaEmbedder(os.environ["OLLAMA_BASE_URL"]),
         QdrantStore(os.environ["QDRANT_URL"]),
+        OllamaReranker(os.environ["OLLAMA_BASE_URL"]),
     )
 
 
@@ -67,6 +70,14 @@ style.hero("Benchmark", "Compare embedding models and chunking strategies on one
 running = metrics.running_report()
 
 
+def _first_p50(result_metrics: dict, per_query) -> float | None:
+    """The median search time of the first search strategy an experiment has finished."""
+    for entry in result_searches(result_metrics, per_query).values():
+        if entry.get("search"):
+            return entry["search"]["total_ms"]["p50"]
+    return None
+
+
 # --- progress of a running report -------------------------------------------------------------
 def _progress(report_id: str) -> None:
     report = metrics.get_report(report_id)
@@ -84,7 +95,7 @@ def _progress(report_id: str) -> None:
                         "Experiment": r["experiment"],
                         "Status": r["status"],
                         "Chunks": (r["metrics"].get("chunking") or {}).get("chunks"),
-                        "Search p50 (ms)": ((r["metrics"].get("search") or {}).get("total_ms") or {}).get("p50"),
+                        "Search p50 (ms)": _first_p50(r["metrics"], r["per_query"]),
                     }
                     for r in results
                 ]
@@ -158,6 +169,36 @@ def _new_benchmark() -> None:
     probe_count = c4.number_input("Probe queries", min_value=1, max_value=100, value=20, help="Sentences taken evenly from the document, for search speed and score spread.")
 
     style.section(
+        "Search strategies",
+        "How each experiment's vectors are searched. All of them search the same collection, so a strategy "
+        "adds searches, not experiments. Hybrid adds a BM25 vector to every point.",
+    )
+    labels = {
+        "dense": "dense",
+        "hybrid": "hybrid (dense + BM25)",
+        "dense+rerank": "dense + rerank",
+        "hybrid+rerank": "hybrid + rerank",
+    }
+    methods = st.multiselect(
+        "Search strategies", SEARCH_METHODS, default=["dense"], format_func=labels.get, label_visibility="collapsed"
+    )
+    rerank_methods = [m for m in methods if m.endswith("+rerank")]
+    rerankers = data.reranker_models()
+    reranker, candidates, rerank_probes = SearchConfig().reranker, 20, 5
+    if rerank_methods:
+        if not rerankers:
+            st.warning(
+                "No reranker model is installed in Ollama. Pull one that can generate, for example "
+                f"`ollama pull {SearchConfig().reranker}`, or drop the rerank strategies."
+            )
+        c1, c2, c3 = st.columns(3)
+        reranker = c1.selectbox("Reranker", rerankers or [reranker])
+        candidates = int(c2.number_input("Candidates", min_value=int(top_k), max_value=100, value=max(20, int(top_k)),
+                                         help="Hits the first search hands to the reranker. It scores each one with a call to Ollama."))
+        rerank_probes = int(c3.number_input("Rerank probe queries", min_value=1, max_value=int(probe_count), value=min(5, int(probe_count)),
+                                            help="Rerank speed is measured on this many probe queries, in one pass."))
+
+    style.section(
         "Test queries (optional)",
         "Add queries with the text that a right chunk must contain, and the report also measures retrieval quality.",
     )
@@ -186,7 +227,11 @@ def _new_benchmark() -> None:
         f"{len(tests)} test queries."
         + (" Larger models and `semantic` take longer." if count else "")
     )
-    if st.button("Start benchmark", type="primary", disabled=bool(running) or count == 0):
+    if rerank_methods:
+        calls = count * len(rerank_methods) * (1 + rerank_probes + len(tests)) * candidates
+        st.caption(f"Reranking makes about {calls:,} calls to Ollama, one per chunk scored. Expect minutes per experiment.")
+    blocked = not methods or (bool(rerank_methods) and not rerankers)
+    if st.button("Start benchmark", type="primary", disabled=bool(running) or count == 0 or blocked):
         settings = BenchmarkSettings(
             models=models,
             strategies=strategies,
@@ -198,6 +243,10 @@ def _new_benchmark() -> None:
             top_k=int(top_k),
             repeats=int(repeats),
             probe_count=int(probe_count),
+            search_methods=methods,
+            reranker=reranker,
+            candidates=candidates,
+            rerank_probe_count=rerank_probes,
         )
         document = Document(doc["doc_id"], doc["name"], Path(doc["dir"]), meta)
         report_id, probes = start_report(document, settings, tests, metrics)
@@ -249,7 +298,7 @@ with tab_reports:
         cards,
         [
             ("Document", report.document["name"] if len(report.document["name"]) <= 18 else report.document["id"], f"{report.document['pages']} pages"),
-            ("Experiments", f"{len(report.rows)} / {stored['total_experiments']}", f"{len(report.failed)} failed"),
+            ("Experiments", f"{report.experiments} / {stored['total_experiments']}", f"{len(report.failed)} failed"),
             ("Status", stored["status"], report.created),
             ("Test queries", str(len(stored["test_queries"] or [])), "quality measured" if report.has_quality else "speed and behaviour only"),
         ],
@@ -279,18 +328,31 @@ with tab_reports:
 
         st.dataframe(frame.style.apply(mark, axis=None), hide_index=True, width="stretch")
 
+        method = report.methods[0]
+        if len(report.methods) > 1:
+            method = st.segmented_control(
+                "Search strategy shown in the speed and quality charts and the test query ranks",
+                report.methods,
+                default=report.methods[0],
+                key=f"method-{stored['report_id']}",
+            ) or report.methods[0]
+        shown = [c for c in report.charts if c.values and c.group in (None, "compare", method)]
         left, right = st.columns(2)
-        for i, chart in enumerate(c for c in report.charts if c.values):
+        for i, chart in enumerate(shown):
             with (left if i % 2 == 0 else right), st.container(border=True):
-                style.section(chart.title, chart.unit)
-                charts.grouped_bars(_frame(chart), chart.unit, fmt=chart.fmt, height=260)
+                suffix = f" ({method} search)" if chart.group == method and len(report.methods) > 1 else ""
+                style.section(chart.title + suffix, chart.unit)
+                charts.grouped_bars(
+                    _frame(chart), chart.unit, fmt=chart.fmt, height=260,
+                    order=report.methods if chart.group == "compare" else None,
+                )
 
-        if report.queries:
+        if report.queries and method in report.queries["by_method"]:
             style.section("Test queries", "Rank of the first chunk that contains the snippet (1 is best; a dash means not found).")
-            q = report.queries
+            q, found = report.queries, report.queries["by_method"][method]
             table = pd.DataFrame(
-                [["–" if r is None else r for r in ranks] for ranks in q["ranks"]],
-                columns=[e["label"] for e in q["experiments"]],
+                [["–" if r is None else str(r) for r in ranks] for ranks in found["ranks"]],
+                columns=[e["label"] for e in found["experiments"]],
             )
             table.insert(0, "Query", [item["query"] for item in q["queries"]])
             st.dataframe(table, hide_index=True, width="stretch")

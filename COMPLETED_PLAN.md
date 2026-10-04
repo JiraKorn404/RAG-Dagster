@@ -831,6 +831,112 @@ Changes from the plan, and notes:
 
 Not included: deleting the uploaded files, the parse cache or PDFs in `data/raw/`, deleting Dagster partitions or run history (they belong to Dagster), renaming an experiment, moving a document between experiments, and bulk or "delete everything" actions.
 
+## Phase 13 — Search strategies in the benchmark
+
+Goal: the benchmark compares, besides embedding model and chunking strategy, how the vectors are searched: **dense** (today), **hybrid** (dense plus BM25, fused), and either of the two followed by a **reranker**. A report row becomes model × chunking × search strategy, so you can see whether hybrid or reranking is worth its cost on a given document.
+
+### Naming
+
+"Strategy" already means the chunking strategy everywhere (`benchmark_results.strategy`, the charts, `STRATEGIES`). The new axis is called **search strategy** on the page and in the report, and `method` in code (`method="hybrid+rerank"`), so the two do not collide.
+
+### What the four methods are
+
+| Method | How it searches | Needs at index time |
+|---|---|---|
+| `dense` | Today's search: query embedded with the instruction prefix, cosine nearest neighbours. | nothing new |
+| `hybrid` | Two Qdrant prefetches, dense and BM25 sparse (`candidates` hits each), fused with reciprocal rank fusion (`FusionQuery(RRF)`), cut to top k. | a BM25 sparse vector on every point |
+| `dense+rerank` | Dense search for `candidates` hits, the reranker scores each (query, chunk) pair, the best top k are returned. | nothing new |
+| `hybrid+rerank` | The `hybrid` search for `candidates` hits, then the same reranking. | a BM25 sparse vector on every point |
+
+### Decisions
+
+| Topic | Decision | Reason |
+|---|---|---|
+| Matrix | The search strategy is **not** a new experiment axis. A report still builds one experiment (collection) per model × chunking strategy, and every chosen search strategy searches that same collection. `total_experiments` and the progress bar still count experiments. | All four methods only differ at query time (the sparse vector is added once). Re-embedding the document per method would cost the most expensive step for nothing. |
+| Sparse vector | Our own BM25 in `embedding/sparse.py`, no new dependency: lower-cased `\w+` tokens, term hashed to a stable 31-bit index, weight `tf·(k1+1) / (tf + k1·(1 − b + b·len/avg_len))` with `k1=1.2`, `b=0.75`, `avg_len` = mean token count of the chunks being indexed. The collection gets a named sparse vector `bm25` with `Modifier.IDF`, so Qdrant does the IDF at query time. The query side is each unique token with weight 1. | Keeps FastEmbed out of the project (CLAUDE.md: "keep dependencies few"; FastEmbed is only ruled out for dense). BM25 is simple enough to own. |
+| Not LlamaIndex's `enable_hybrid` | The sparse vector is written by a second step after `QdrantVectorStore.add`: `client.update_vectors` on the same deterministic point ids. | `enable_hybrid` renames the dense vector (`text-dense`) and wants a FastEmbed sparse model, which breaks the "unnamed vector" layout every existing collection has. |
+| `IndexConfig.sparse` | New `sparse: bool = False`. Left out of the config hash while false (the way `engine` is when `native`), so no existing hash changes. The benchmark sets it true for every experiment when a hybrid method is chosen. Dagster runs get it from `resources.experiment.config.index.sparse`; the assets need no change. | Hybrid needs the sparse vector at index time, and an experiment's hash must say whether it has it. |
+| Search settings are not experiment settings | New `SearchConfig` in `config.py` (`method`, `candidates=20`, `reranker`, `rerank_instruction`) passed to `search()`; it is **not** part of `ExperimentConfig` or its hash. | Changing how you search must not make a new experiment. |
+| Existing collections | `ensure_collection(sparse=True)` adds the sparse vector config only when it creates the collection. A collection that exists without it and is asked for `sparse=True` raises, as a wrong vector size does. | Benchmark collections are always new. Adding a sparse vector to a live collection is not needed yet. |
+| Reranker | Qwen3-Reranker through Ollama `/api/generate`, one call per (query, chunk): the model's own yes/no prompt sent with `raw: true`, `num_predict: 1`, `logprobs` on; the score is `P(yes) / (P(yes) + P(no))` from the first token's log-probabilities. One reranker per report (a setting), not an axis. The page lists installed models whose name contains `reranker`; with none installed the rerank methods are disabled and the hint says what to pull. | Same family as the embedding models, no new service or dependency. Ollama has no rerank endpoint. |
+| What each search strategy reports | `search`: latency (query embedding, Qdrant, rerank, total; p50 etc.). Only `dense` also reports `top1_similarity` and `gap_top1_topk`. `quality` (with test queries): the same metrics as now, plus per-query first relevant rank. | RRF scores and reranker probabilities are not cosine similarities, so "similarity spread" means something only for `dense`. |
+| Reranking cost | Rerank latency is measured on the first `rerank_probe_count` probe queries (default 5), one timed pass after the warm-up. Quality uses every test query. The page shows the number of reranker calls before Start (experiments × rerank methods × queries × `candidates`). | 20 candidates × 20 queries × 4 passes × 2 methods × 15 experiments would be about 48,000 CPU generate calls. |
+| Stored result shape | No migration. Each `benchmark_results.metrics` gets `searches: {method: {search, quality, per_query}}`; the experiment-level parts (`chunking`, `embedding`, `index`, `snippet_coverage`) stay where they are. A saved report without `searches` is read as one `dense` entry made from its old `search`, `quality` and `per_query`. | Old reports keep opening, and the results table keeps one row per experiment (it is also what "delete this run's experiments" uses). |
+| Report | One row per (model, chunking, search strategy). Chunks, mean tokens and embed speed are experiment-level, so they repeat on the experiment's rows and are marked best over experiments, not rows. New columns: `Search`, and `Rerank p50 (ms)` when a rerank method ran. A segmented control picks the search strategy shown in the speed and quality charts and the per-query rank table (default `dense`); the PDF draws those on one page per strategy. One new chart, "Search strategies compared" (nDCG@cutoff, and median latency, per model, mean over the chunking strategies), answers the main question at a glance. | Charts and the rank table are already as wide as they can be with model × chunking. |
+| Dense query embedding | Not shared between the methods of one experiment. Each method calls `search()` as it is. | The cost is the same for every method, and `search()` stays simple. |
+| Try a query page | A "Search strategy" select above the form (the experiment select moved out of the form with it, because which strategies are offered depends on the experiment): `hybrid` only for an experiment whose stored config has `index.sparse`, the rerank strategies only when a reranker is installed, plus a reranker select and `candidates` when one is chosen. The result line names the strategy, the rerank time and what the score means. | Asked for in the request; the benchmark's experiments are kept and searchable, so their hybrid collections can be tried by hand. |
+| Tests | One case in the existing hash test (`sparse=False` leaves every hash unchanged, `sparse=True` changes it). One small test each for the sparse vector builder and for the yes/no score. | The rules allow tests for hashing and vector construction; a silent bug in these two changes every ranking without an error. Drop them if you disagree. |
+
+### 13.0 Check the assumptions on the real stack (throwaway scripts, not in the repo)
+
+- [x] Qdrant: one collection with the unnamed 1024-dimension dense vector and a named sparse vector `bm25` (`Modifier.IDF`); `QdrantVectorStore.add` still writes the unnamed vector when the collection also has a sparse config; `update_vectors` writes `bm25` for the same point ids; `query_points` with two `Prefetch` entries and `FusionQuery(RRF)` returns fused hits.
+- [x] Ollama: this Ollama's version supports `logprobs` on `/api/generate`; pull a Qwen3-Reranker (a community GGUF, for example `dengcao/Qwen3-Reranker-0.6B`; confirm the tag, and which of 0.6b, 4b and 8b is worth the time on this hardware); a relevant chunk scores clearly above an irrelevant one for the same query; time one call.
+- [x] If `logprobs` is missing, stop and decide with the user before going on (a hard yes/no score would rerank poorly). Write what was found, and the chosen reranker tag, into the decisions table above.
+
+### 13.1 Config
+
+- [x] `IndexConfig.sparse` and its hash exception; `SearchConfig`. One extra case in `tests/test_config_and_vectors.py`.
+
+### 13.2 Sparse vectors
+
+- [x] `embedding/sparse.py`: tokeniser, `document_vectors(texts)` and `query_vector(text)` returning indices and values; a small test.
+- [x] `QdrantStore`: `ensure_collection(..., sparse)`; `add_sparse(collection, ids, vectors)`; `query(..., method)` runs the hybrid query when the method is hybrid.
+- [x] `ingest.index_chunks`: when `config.index.sparse`, build the vectors after the dense write, and add `sparse_ms` to the `index` stage details.
+
+### 13.3 Reranker
+
+- [x] `reranking/ollama.py`: `OllamaReranker(base_url)` with `score(query, texts) -> list[float]` (the same retry and timeout habits as `OllamaEmbedder`); the pure score function from log-probabilities, with a small test. `resources/` is not touched: it is only used by the benchmark and the UI for now.
+
+### 13.4 Search
+
+- [x] `search()` takes `method`, `candidates` and a reranker, and returns hits ranked by the method; `SearchResult` gains `method` and `rerank_ms`. The default is `dense`, so the CLI, `ask()` and Try a query behave as today.
+
+### 13.5 Benchmark runner
+
+- [x] `BenchmarkSettings`: `search_methods` (default `["dense"]`), `reranker`, `candidates`, `rerank_probe_count`. `experiment_config` sets `index.sparse` when a hybrid method is chosen. `Services` gets the reranker.
+- [x] `run_experiment`: after the experiment is built, loop over the methods (all non-rerank ones first, so the embedding model is not swapped out between them), `_search_metrics` and `_quality` take the method, and the result is stored in `searches` as above. The progress step reads "searching: hybrid+rerank".
+- [x] `start_report` stores the new settings with the report.
+
+### 13.6 Report, PDF and page
+
+- [x] `report.py`: read old and new result shapes, one row per method, the new columns, the experiment-level "best", the "Search strategies compared" chart, notes on score scales and on reranking cost. The charts' `strategy` order stops assuming it is a chunking strategy (`strategy_order` is given the order).
+- [x] `pdf.py`: the same rows, one chart page per search strategy, the new chart.
+- [x] `ui/benchmark.py`: a "Search strategies" multiselect (default: `dense`), the reranker select, `candidates` and `rerank_probe_count` inputs shown when a rerank method is chosen, the call-count caption, and the segmented control on the report view. `data.py`: `reranker_models()` beside `embedding_models()`.
+
+### 13.7 Docs
+
+- [x] `CLAUDE.md`: the four methods, `IndexConfig.sparse` and its hash rule, the reranker, the new result shape and the "similarity is only cosine for `dense`" fact, the new files in the layout, and the status line.
+
+Done when, checked once on the real stack: a benchmark of `aiayn.pdf` (uploaded again on the Benchmark page if `data/uploads/` no longer has it) with `qwen3-embedding:0.6b`, the `hybrid` and `recursive` chunking strategies, all four search strategies and about eight test queries (some that quote a rare term from the paper, some that paraphrase it) finishes and gives 8 rows; the experiments' collections have a `bm25` vector on every point; the `hybrid` rows rank at least one query differently from `dense`; the rerank rows show a rerank time and a changed order; a report made before this phase still opens and reads as `dense`; the PDF downloads and has the new rows and chart; the config hash of an experiment made before this phase is unchanged. The throwaway experiments are deleted afterwards. No other test files are added.
+
+### Not in this phase
+
+The Upload page choosing whether to build the BM25 vector (a normal experiment has none, so hybrid is only offered on Try a query for experiments made with `index.sparse`, which the benchmark does); DBSF fusion or learned sparse models such as SPLADE; the reranker as its own axis; caching reranker scores; exact search and `hnsw_ef`; Thai or other languages without spaces between words (the BM25 tokeniser needs a word segmenter for those, and a table of English academic text is what it is checked on).
+
+### Risks
+
+| Risk | Handling |
+|---|---|
+| `QdrantVectorStore` misreads a collection that also has a sparse vector config and writes the dense vector under a different name | Checked first in 13.0; if it does, write the points ourselves for sparse experiments. |
+| Ollama has no `logprobs`, or the reranker model's answer is not a clean yes or no | 13.0 stops and asks before anything is built. |
+| Reranking is slow, and the embedding model and the reranker may not both stay loaded in Ollama (the 8b embedding model plus an 8b reranker) | Candidate and query counts are small by default and shown before Start; the 0.6b reranker is the first to try. Slow runs are an accepted cost, not a bug. |
+| BM25 over Markdown tables and numbers behaves oddly (a `|` row of figures is a handful of tokens) | Tokens are `\w+`, so separators vanish and numbers are kept; the test queries that quote a number show whether it helps. |
+| Per-document `avg_len` makes scores differ between two documents in one experiment | Benchmarks hold one document. Revisit if hybrid is offered on the Upload page. |
+
+**Status: done (2026-10-03).** Checked once on the real stack: benchmark report `ae0d37` on `aiayn.pdf` with `qwen3-embedding:0.6b`, the `hybrid` and `recursive` chunking strategies, all four search strategies, six test queries (some quoting the paper, some paraphrasing it), top k 10, 6 probe queries, 10 candidates and the first 2 probes for rerank timing. The page code was driven with Streamlit's app tester; the numbers were read from Postgres, Qdrant and the built report.
+- **13.0:** Qdrant 1.16.3 takes the unnamed 4-dimension dense vector and a named sparse `bm25` (IDF modifier) in one collection; `QdrantVectorStore.add` still wrote the unnamed vector (the client shows it as `''`); `update_vectors` set `bm25` on the same ids; a `query_points` with two `Prefetch`es and `FusionQuery(RRF)` returned the point that had the rare term first (Qdrant's RRF scores were 0.75, 0.5, 0.33). Ollama 0.35.0 supports `logprobs`. The reranker was the real finding: `dengcao/Qwen3-Reranker-0.6B:Q8_0` answered `,` for every prompt with every token at `ln(1/vocab)` (a broken build), `0.6B:F16` gave `yes` at `-8` (flat, weak), `pdurugyan/qwen3-reranker-0.6b-q8_0` is an embedding build ("does not support generate"), and **`dengcao/Qwen3-Reranker-4B:Q4_K_M`** gave `yes` at `-0.14` for a relevant chunk and `No`/`no` at about `-1` for an irrelevant one. That is the default reranker. My first scoring script took the last of several spellings of "yes" and looked wrong; `yes_probability` sums `yes`, `Yes` and ` yes`. The two 0.6B builds I pulled were removed again.
+- **Results (6 test queries, so one query moves recall by 0.17):** hybrid raised recall@5 from 0.83 to 1.00 and MRR from 0.73 to 0.81 (chunking `hybrid`) and from 0.71 to 0.76 (`recursive`); the paraphrase query that dense ranked 9th (or not at all) became 2nd and 3rd. Reranking did not help with every chunker: `dense+rerank` on `recursive` left MRR at 0.71, `hybrid+rerank` on `recursive` gave the best MRR (0.88) and nDCG@5 (0.91). Search p50: dense 29 to 31 ms, hybrid 33 to 34 ms, reranked 0.9 to 1.4 s for 10 candidates (about 0.1 s a pair; with the 4B model loaded the first call took 8 s). Every point of both collections had a `bm25` vector (41 and 44 points).
+- **Report and pages:** 8 rows (2 experiments × 4 strategies), 16 charts (embedding speed and chunks once; the two search-strategy comparison charts; speed, nDCG and MRR for each strategy), per-strategy rank tables, a 17.8 kB PDF. The two reports from before the phase (`e1204e`, `f41495`) built and drew as `dense` with their PDFs. All 23 stored experiments recomputed to the same `config_hash`. Try a query offered `dense`, `hybrid`, `dense + rerank` and `hybrid + rerank` for the new experiment, and only `dense` and `dense + rerank` for an older one; the hybrid and the hybrid + rerank searches ran and named the score they return. On the Benchmark page, picking a rerank strategy showed the reranker, candidates and rerank-probe inputs and a call estimate (about 1,800 calls for 15 experiments).
+- The report's experiments were deleted afterwards; the report row `ae0d37` stays (the Benchmark page shows it as a report whose experiments are deleted). 11 tests pass (4 new: the hash with `sparse`, the sparse vector builder, the yes/no score).
+
+Changes from the plan, and notes:
+- `QdrantStore.query` takes `sparse` and `branch_limit` instead of a `method`; `search()` builds the sparse query vector and, for the rerank methods, fetches `max(candidates, top k)` hits first. A hybrid search of a collection with no `bm25` raises a plain message instead of Qdrant's.
+- The page offers only rerankers that Ollama reports with the `completion` capability, which leaves out the embedding-style 0.6B build.
+- A failing search strategy is recorded in its own entry (`searches.<method>.error`) and shown under "Failed experiments"; the experiment itself still counts as done.
+- The per-query rank table's cells are strings now: a column that mixed numbers and `–` made pyarrow log a conversion error (an old problem the new tables made more likely).
+- The CLI and `ask()` stay dense-only.
+- Not verified: how the new charts and the segmented control look in a browser (the app tester does not draw them), and a full benchmark with the 8b embedding model next to the 4B reranker in Ollama's memory.
+
 ## Ideas that later phases overtook
 
 These were in the Ideas list. Phase 11 removed the matrix, the dashboard and the query-set file they refer to, and the benchmark now parses a document once.

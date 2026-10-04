@@ -1,6 +1,6 @@
 import math
 
-from rag_lab.config import ChunkConfig, ExperimentConfig, ParseConfig, SemanticSettings
+from rag_lab.config import ChunkConfig, ExperimentConfig, IndexConfig, ParseConfig, SemanticSettings
 from rag_lab.embedding.vectors import truncate_and_normalise
 
 
@@ -32,6 +32,12 @@ def test_config_hash_tells_engines_apart_and_defaults_to_llamaindex():
     assert default.config_hash() != ExperimentConfig(
         name="a", chunk=ChunkConfig(engine="native")
     ).config_hash()
+
+
+def test_sparse_changes_the_hash_only_when_on():
+    plain = ExperimentConfig(name="a")
+    assert ExperimentConfig(name="a", index=IndexConfig(sparse=False)).config_hash() == plain.config_hash()
+    assert ExperimentConfig(name="a", index=IndexConfig(sparse=True)).config_hash() != plain.config_hash()
 
 
 def test_tag_changes_the_hash_only_when_set_and_never_the_settings_hash():

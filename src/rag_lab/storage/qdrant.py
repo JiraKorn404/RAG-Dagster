@@ -6,17 +6,25 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     FilterSelector,
+    Fusion,
+    FusionQuery,
     HnswConfigDiff,
     MatchValue,
+    Modifier,
     PayloadSchemaType,
+    PointVectors,
+    Prefetch,
     ScoredPoint,
     SearchParams,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 
 from rag_lab.config import IndexConfig
 
 PAYLOAD_INDEXES = ("doc_id", "modality", "source_file")
+SPARSE_VECTOR = "bm25"  # the name of the sparse vector; the dense one stays unnamed
 _NAMESPACE = uuid.UUID("6f1d3a52-6d0b-4e0e-9a43-5b7d1c1f0a11")
 
 
@@ -30,21 +38,42 @@ class QdrantStore:
         self.client = QdrantClient(url=url, prefer_grpc=True, grpc_port=grpc_port)
 
     def ensure_collection(self, name: str, dimension: int, index: IndexConfig) -> None:
-        """Create the collection if missing; refuse to reuse one with a different vector size."""
+        """Create the collection if missing (with a BM25 sparse vector when `index.sparse`); refuse to
+        reuse one with a different vector size, or one without the sparse vector when it is asked for."""
         if self.client.collection_exists(name):
-            params = self.client.get_collection(name).config.params.vectors
-            if params.size != dimension:
+            params = self.client.get_collection(name).config.params
+            if params.vectors.size != dimension:
                 raise ValueError(
-                    f"Collection '{name}' has vector size {params.size}, expected {dimension}"
+                    f"Collection '{name}' has vector size {params.vectors.size}, expected {dimension}"
+                )
+            if index.sparse and SPARSE_VECTOR not in (params.sparse_vectors or {}):
+                raise ValueError(
+                    f"Collection '{name}' has no sparse vector, so it cannot take `index.sparse`. "
+                    "Use a new experiment name."
                 )
             return
         self.client.create_collection(
             name,
             vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+            sparse_vectors_config=(
+                {SPARSE_VECTOR: SparseVectorParams(modifier=Modifier.IDF)} if index.sparse else None
+            ),
             hnsw_config=HnswConfigDiff(m=index.hnsw_m, ef_construct=index.hnsw_ef_construct),
         )
         for field in PAYLOAD_INDEXES:
             self.client.create_payload_index(name, field, PayloadSchemaType.KEYWORD)
+
+    def add_sparse(self, collection: str, point_ids: list[str], vectors: list[tuple[list[int], list[float]]]) -> None:
+        """Set the BM25 vector on points that already exist (written with their dense vector)."""
+        for i in range(0, len(point_ids), 256):
+            self.client.update_vectors(
+                collection,
+                points=[
+                    PointVectors(id=pid, vector={SPARSE_VECTOR: SparseVector(indices=idx, values=val)})
+                    for pid, (idx, val) in zip(point_ids[i : i + 256], vectors[i : i + 256])
+                ],
+                wait=True,
+            )
 
     def delete_document(self, collection: str, doc_id: str) -> None:
         self.client.delete(
@@ -62,8 +91,13 @@ class QdrantStore:
         top_k: int,
         filters: dict[str, str] | None = None,
         hnsw_ef: int | None = None,
+        sparse: tuple[list[int], list[float]] | None = None,
+        branch_limit: int | None = None,
     ) -> list[ScoredPoint]:
-        """Nearest points by cosine. With the cosine metric, `score` is the similarity itself."""
+        """Nearest points by cosine. With the cosine metric, `score` is the similarity itself.
+        With a `sparse` query vector the search is hybrid: the dense and the BM25 search each fetch
+        `branch_limit` points and are fused by reciprocal rank fusion, so `score` is then a fusion
+        score, not a similarity."""
         if not self.client.collection_exists(collection):
             raise ValueError(f"Collection '{collection}' does not exist. Ingest a document first.")
         query_filter = (
@@ -71,12 +105,31 @@ class QdrantStore:
             if filters
             else None
         )
+        params = SearchParams(hnsw_ef=hnsw_ef) if hnsw_ef else None
+        if sparse is None:
+            response = self.client.query_points(
+                collection,
+                query=vector,
+                limit=top_k,
+                query_filter=query_filter,
+                search_params=params,
+                with_payload=True,
+            )
+            return response.points
+        limit = max(branch_limit or top_k, top_k)
         response = self.client.query_points(
             collection,
-            query=vector,
+            prefetch=[
+                Prefetch(query=vector, limit=limit, filter=query_filter, params=params),
+                Prefetch(
+                    query=SparseVector(indices=sparse[0], values=sparse[1]),
+                    using=SPARSE_VECTOR,
+                    limit=limit,
+                    filter=query_filter,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
             limit=top_k,
-            query_filter=query_filter,
-            search_params=SearchParams(hnsw_ef=hnsw_ef) if hnsw_ef else None,
             with_payload=True,
         )
         return response.points

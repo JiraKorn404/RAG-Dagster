@@ -82,6 +82,39 @@ class IndexConfig(_Section):
     hnsw_m: int = 16
     hnsw_ef_construct: int = 100
     hnsw_ef: int | None = None  # search-time ef; None uses the Qdrant default
+    # Also store a BM25 sparse vector on every point, which the hybrid search methods need. Left out
+    # of the config hash while false, so the hashes of experiments made before it existed are unchanged.
+    sparse: bool = False
+
+
+SearchMethod = Literal["dense", "hybrid", "dense+rerank", "hybrid+rerank"]
+SEARCH_METHODS: tuple[str, ...] = ("dense", "hybrid", "dense+rerank", "hybrid+rerank")
+
+
+class SearchConfig(_Section):
+    """How an experiment is searched. Not part of ExperimentConfig or its hash: changing how you search
+    does not make a new experiment."""
+
+    method: SearchMethod = "dense"
+    # What the first stage hands on: each branch of a hybrid search fetches this many hits, and a
+    # reranker scores this many. At least top k is always fetched.
+    candidates: int = 20
+    reranker: str = "dengcao/Qwen3-Reranker-4B:Q4_K_M"
+    rerank_instruction: str = (
+        "Given a question, retrieve relevant passages from the documents that answer it"
+    )
+    keep_alive: str = "30m"
+    # The reranker's context window. Ollama's default (40k) makes the model take about 9 GB of memory,
+    # which pushes the embedding model out. A prompt is the instruction, the query and one chunk.
+    rerank_num_ctx: int = 2048
+
+    @property
+    def hybrid(self) -> bool:
+        return self.method.startswith("hybrid")
+
+    @property
+    def rerank(self) -> bool:
+        return self.method.endswith("+rerank")
 
 
 class ExperimentConfig(_Section):
@@ -116,6 +149,8 @@ class ExperimentConfig(_Section):
                 data["chunk"].pop(strategy)  # unused strategy settings do not identify the experiment
         if self.chunk.engine == "native":
             data["chunk"].pop("engine")  # keeps the hashes of the experiments run before `engine` existed
+        if not self.index.sparse:
+            data["index"].pop("sparse")  # keeps the hashes of the experiments made before `sparse` existed
         if not (with_tag and self.tag):
             data.pop("tag")
         payload = json.dumps(data, sort_keys=True)

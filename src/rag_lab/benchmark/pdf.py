@@ -12,6 +12,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (
     KeepTogether,
+    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Table,
@@ -138,7 +139,7 @@ def report_pdf(report: Report) -> bytes:
     facts = [
         ["Document", _escape(d["name"]), "Pages", str(d["pages"] or "-")],
         ["Document id", _escape(d["id"]), "Tables", str(d["tables"] if d["tables"] is not None else "-")],
-        ["Experiments", f"{len(report.rows)} finished, {len(report.failed)} failed", "Parse time", f"{d['parse_seconds'] or 0:.0f} s"],
+        ["Experiments", f"{report.experiments} finished, {len(report.failed)} failed", "Parse time", f"{d['parse_seconds'] or 0:.0f} s"],
     ]
     out.append(_table([[Paragraph(c, st["small"]) for c in row] for row in facts], [30 * mm, 90 * mm, 25 * mm, 40 * mm], head_rows=0))
 
@@ -149,7 +150,7 @@ def report_pdf(report: Report) -> bytes:
     if report.rows:
         data = [report.columns] + report.rows
         table = _table(data, font=8)
-        style_cmds = [("ALIGN", (2, 0), (-1, -1), "RIGHT")]
+        style_cmds = [("ALIGN", (3, 0), (-1, -1), "RIGHT")]
         for row, col in report.best:
             style_cmds += [
                 ("BACKGROUND", (col, row + 1), (col, row + 1), BEST),
@@ -165,28 +166,46 @@ def report_pdf(report: Report) -> bytes:
     strategies = list(dict.fromkeys(r[1] for r in report.rows))
     if report.rows:
         half = (width - 6 * mm) / 2
-        cells = [_bar_chart(c, models, strategies, half, 190) for c in report.charts if c.values]
-        rows = [
-            Table([cells[i : i + 2] + [""] * (2 - len(cells[i : i + 2]))], colWidths=[half + 3 * mm, half + 3 * mm], hAlign="LEFT")
-            for i in range(0, len(cells), 2)
-        ]
-        if rows:  # the heading stays with the first row of charts
-            out.append(KeepTogether([Paragraph("Charts", st["h2"]), rows[0]]))
-            out += rows[1:]
+
+        def chart_rows(charts: list[Chart], x_labels: list[str]) -> list[Table]:
+            cells = [_bar_chart(c, models, x_labels, half, 190) for c in charts if c.values]
+            return [
+                Table([cells[i : i + 2] + [""] * (2 - len(cells[i : i + 2]))], colWidths=[half + 3 * mm, half + 3 * mm], hAlign="LEFT")
+                for i in range(0, len(cells), 2)
+            ]
+
+        # Per experiment first, then the search strategies side by side, then one page of charts for each
+        # search strategy (the speed and quality of its experiments).
+        groups = [("Charts", [c for c in report.charts if c.group is None], strategies)]
+        if any(c.group == "compare" for c in report.charts):
+            groups.append(("Search strategies compared", [c for c in report.charts if c.group == "compare"], report.methods))
+        for method in report.methods:
+            charts = [c for c in report.charts if c.group == method]
+            groups.append((f"Charts: {method} search" if len(report.methods) > 1 else "Search charts", charts, strategies))
+        for title, charts, x_labels in groups:
+            rows = chart_rows(charts, x_labels)
+            if rows:  # the heading stays with the first row of charts
+                if title.startswith("Charts: "):
+                    out.append(PageBreak())
+                out.append(KeepTogether([Paragraph(title, st["h2"]), rows[0]]))
+                out += rows[1:]
 
     if report.queries:
         q = report.queries
         out.append(Paragraph("Test queries: rank of the first relevant chunk", st["h2"]))
-        head = ["Query"] + [_latin1(e["label"]).replace(" ", "\n") for e in q["experiments"]]
-        body = [
-            [Paragraph(_escape(item["query"]), st["small"])] + [("-" if r is None else str(r)) for r in ranks]
-            for item, ranks in zip(q["queries"], q["ranks"])
-        ]
-        label_width = 70 * mm
-        col = (width - label_width) / max(len(q["experiments"]), 1)
-        table = _table([head] + body, [label_width] + [col] * len(q["experiments"]), font=6.5)
-        table.setStyle(TableStyle([("ALIGN", (1, 0), (-1, -1), "CENTER")]))
-        out.append(table)
+        for method, found in q["by_method"].items():
+            if len(q["by_method"]) > 1:
+                out.append(Paragraph(f"{_escape(method)} search", st["note"]))
+            head = ["Query"] + [_latin1(e["label"]).replace(" ", "\n") for e in found["experiments"]]
+            body = [
+                [Paragraph(_escape(item["query"]), st["small"])] + [("-" if r is None else str(r)) for r in ranks]
+                for item, ranks in zip(q["queries"], found["ranks"])
+            ]
+            label_width = 70 * mm
+            col = (width - label_width) / max(len(found["experiments"]), 1)
+            table = _table([head] + body, [label_width] + [col] * len(found["experiments"]), font=6.5)
+            table.setStyle(TableStyle([("ALIGN", (1, 0), (-1, -1), "CENTER")]))
+            out.append(table)
         out.append(Paragraph("1 is best; a dash means no chunk in the top results contained the snippet.", st["note"]))
 
     if report.failed:

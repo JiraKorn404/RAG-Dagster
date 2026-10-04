@@ -11,7 +11,7 @@ import re
 import time
 import traceback
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import fmean
 
@@ -20,13 +20,14 @@ from docling_core.types.doc import DoclingDocument
 from rag_lab.chunking import chunk_document, summarise
 from rag_lab.chunking.models import Chunk
 from rag_lab.chunking.segment import reference_text, segment
-from rag_lab.config import ChunkConfig, EmbedConfig, ExperimentConfig
+from rag_lab.config import ChunkConfig, EmbedConfig, ExperimentConfig, IndexConfig, SearchConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.ingest import clean_experiment_name, ingest_document
 from rag_lab.library import delete_experiment
 from rag_lab.metrics.retrieval import query_metrics, relevance
 from rag_lab.metrics.stats import latency_summary
 from rag_lab.metrics.store import MetricsStore
+from rag_lab.reranking import OllamaReranker
 from rag_lab.search import search
 from rag_lab.storage.qdrant import QdrantStore
 
@@ -47,9 +48,24 @@ class BenchmarkSettings:
     top_k: int = 10
     repeats: int = 3  # timed passes over the probe queries, after one warm-up pass
     probe_count: int = 20
+    # How the vectors are searched. Every method searches the same collections, so they add searches,
+    # not experiments. A rerank method is timed on fewer probe queries and one pass (it is slow).
+    search_methods: list[str] = field(default_factory=lambda: ["dense"])
+    reranker: str = SearchConfig().reranker
+    candidates: int = 20
+    rerank_probe_count: int = 5
 
     def asdict(self) -> dict:
         return asdict(self)
+
+    @property
+    def ordered_methods(self) -> list[str]:
+        """The methods that need no reranker first, so the embedding model is not swapped out of Ollama
+        for the reranker and back in between them."""
+        return sorted(self.search_methods, key=lambda m: (m.endswith("+rerank"), self.search_methods.index(m)))
+
+    def options(self, method: str) -> SearchConfig:
+        return SearchConfig(method=method, candidates=self.candidates, reranker=self.reranker)
 
     @property
     def combinations(self) -> list[tuple[str, str]]:
@@ -76,6 +92,7 @@ class Services:
     metrics: MetricsStore
     embedder: OllamaEmbedder
     qdrant: QdrantStore
+    reranker: OllamaReranker
 
 
 def model_slug(model: str) -> str:
@@ -93,6 +110,7 @@ def experiment_config(settings: BenchmarkSettings, name: str, model: str, strate
         name=name,
         tag=name,  # its own hash even when another experiment has the same settings
         embed=EmbedConfig(model=model),
+        index=IndexConfig(sparse=any(m.startswith("hybrid") for m in settings.search_methods)),
         chunk=ChunkConfig(
             engine=settings.engine,
             strategy=strategy,
@@ -145,29 +163,44 @@ def _hit_dicts(result) -> list[dict]:
     return [{"text": h.text, "chunk_id": h.chunk_id, "page": h.page} for h in result.hits]
 
 
-def _search_metrics(config, settings, probes, services) -> dict:
-    """A warm-up pass, then `repeats` timed passes over the probe queries."""
+def _search_metrics(config, settings, probes, services, options: SearchConfig) -> dict:
+    """A warm-up pass, then `repeats` timed passes over the probe queries. A rerank method does one
+    warm-up query and one timed pass over the first `rerank_probe_count` probes. Similarity spread is
+    reported for `dense` only: the scores of the other methods are not cosine similarities."""
+    rerank = options.rerank
+    if rerank:
+        probes = probes[: settings.rerank_probe_count]
+    repeats = 1 if rerank else settings.repeats
+
+    def run(q):
+        return search(
+            q, config, services.embedder, services.qdrant, settings.top_k,
+            options=options, reranker=services.reranker,
+        )
+
     cold_first_ms = None
-    for q in probes:
-        r = search(q, config, services.embedder, services.qdrant, settings.top_k)
+    for q in probes[:1] if rerank else probes:
+        r = run(q)
         cold_first_ms = r.total_ms if cold_first_ms is None else cold_first_ms
-    embed, qdrant_ms, total, top1, gap = [], [], [], [], []
+    embed, qdrant_ms, rerank_ms, total, top1, gap = [], [], [], [], [], []
     warm_first = []
-    for repeat in range(settings.repeats):
+    for repeat in range(repeats):
         for i, q in enumerate(probes):
-            r = search(q, config, services.embedder, services.qdrant, settings.top_k)
+            r = run(q)
             embed.append(r.embed_ms)
             qdrant_ms.append(r.search_ms)
+            rerank_ms.append(r.rerank_ms)
             total.append(r.total_ms)
             if i == 0:
                 warm_first.append(r.total_ms)
-            if repeat == 0 and r.hits:
+            if repeat == 0 and r.hits and options.method == "dense":
                 top1.append(r.hits[0].similarity)
                 gap.append(r.hits[0].similarity - r.hits[-1].similarity)
     return {
         "queries": len(probes),
         "embed_ms": latency_summary(embed),
         "search_ms": latency_summary(qdrant_ms),
+        "rerank_ms": latency_summary(rerank_ms) if rerank else None,
         "total_ms": latency_summary(total),
         "queries_per_second": len(total) / (sum(total) / 1000),
         "first_query_cold_ms": cold_first_ms,
@@ -177,12 +210,15 @@ def _search_metrics(config, settings, probes, services) -> dict:
     }
 
 
-def _quality(config, settings, test_queries: list[TestQuery], services) -> tuple[dict, list[dict]]:
+def _quality(config, settings, test_queries: list[TestQuery], services, options: SearchConfig) -> tuple[dict, list[dict]]:
     """Mean of each quality metric over the test queries, and each query's first relevant rank."""
     ks = [k for k in QUALITY_KS if k <= settings.top_k]
     per_query_metrics, per_query = [], []
     for tq in test_queries:
-        result = search(tq.query, config, services.embedder, services.qdrant, settings.top_k)
+        result = search(
+            tq.query, config, services.embedder, services.qdrant, settings.top_k,
+            options=options, reranker=services.reranker,
+        )
         rel = relevance(_hit_dicts(result), [{"contains": tq.snippet}])
         per_query_metrics.append(query_metrics(rel, 1, ks))
         per_query.append(
@@ -199,6 +235,17 @@ def _quality(config, settings, test_queries: list[TestQuery], services) -> tuple
     return quality, per_query
 
 
+def result_searches(result: dict, per_query: list[dict] | None = None) -> dict[str, dict]:
+    """The search results of one experiment, by method: {method: {search, quality, per_query, error}}.
+    A result saved before search methods existed has its `search`, `quality` and `per_query` at the top
+    level (`per_query` in its own column); it is read as the `dense` method."""
+    if "searches" in result:
+        return result["searches"]
+    if result.get("search") is None:
+        return {}
+    return {"dense": {"search": result["search"], "quality": result.get("quality"), "per_query": per_query, "error": None}}
+
+
 def run_experiment(
     report_id: str,
     document: Document,
@@ -211,7 +258,7 @@ def run_experiment(
     services: Services,
     on_step=lambda step: None,
 ) -> tuple[str, dict, list[dict] | None]:
-    """Build one experiment and measure it. Returns (experiment name, metrics, per-query results)."""
+    """Build one experiment and measure it. Returns (experiment name, metrics, None): the per-query results are inside `metrics['searches']`."""
     name = experiment_name(document.name, report_id, model, strategy)
     config = experiment_config(settings, name, model, strategy)
 
@@ -229,7 +276,6 @@ def run_experiment(
         on_step=on_step,
     )
 
-    on_step("searching with the probe queries")
     metrics = {
         "chunking": {
             **summary,
@@ -246,16 +292,24 @@ def run_experiment(
             "dimension": embedded["dimension"],
         },
         "index": {"upsert_ms": indexed["upsert_ms"], "points": indexed["collection_points"]},
-        "search": _search_metrics(config, settings, probes, services),
-        "quality": None,
+        "searches": {},
         "snippet_coverage": None,
     }
-    per_query = None
     if test_queries:
-        on_step("scoring the test queries")
         metrics["snippet_coverage"] = snippet_coverage(chunks, [t.snippet for t in test_queries])
-        metrics["quality"], per_query = _quality(config, settings, test_queries, services)
-    return name, metrics, per_query
+    for method in settings.ordered_methods:
+        options = settings.options(method)
+        entry = {"search": None, "quality": None, "per_query": None, "error": None}
+        try:
+            on_step(f"searching with the probe queries ({method})")
+            entry["search"] = _search_metrics(config, settings, probes, services, options)
+            if test_queries:
+                on_step(f"scoring the test queries ({method})")
+                entry["quality"], entry["per_query"] = _quality(config, settings, test_queries, services, options)
+        except Exception as e:  # noqa: BLE001  (one method failing does not lose the experiment)
+            entry["error"] = f"{type(e).__name__}: {e}"
+        metrics["searches"][method] = entry
+    return name, metrics, None
 
 
 def start_report(

@@ -48,7 +48,7 @@ Chatbot: question -> condense -> hybrid search + rerank -> grade -> answer with 
 ## Getting started
 
 ```powershell
-copy .env.example .env      # then set OLLAMA_BASE_URL, POSTGRES_USER and POSTGRES_PASSWORD
+copy .env.example .env      # then set OLLAMA_BASE_URL, POSTGRES_USER, POSTGRES_PASSWORD, SQL_LOADER_PASSWORD and SQL_READER_PASSWORD
 docker compose up -d --build
 ```
 
@@ -61,7 +61,8 @@ The first start is slow: the code container takes about 50 s because it imports 
 | **Experiments** | Lists every experiment with the PDFs in it. Delete a PDF from an experiment, or a whole experiment. |
 | **Upload** | Upload a PDF, pick a chunking strategy and its settings, see where the cuts fall in the document, and embed it into a new or existing experiment. Tick *Add a BM25 keyword vector* if you want hybrid search later; it cannot be added to an experiment afterwards. |
 | **Try a query** | Pick an experiment and a search strategy (`dense`, `hybrid`, `dense+rerank`, `hybrid+rerank`), set top k, and see the chunks with their scores and timings. |
-| **Chatbot** | Ask questions of an experiment that has a BM25 vector. The answer is written from the top chunks of a hybrid search with reranking, with `[n]` citations. The page shows what happens as it happens: each step, the model's thinking, the retrieved chunks and scores, how full the model's context is, and how long each step took. If the documents do not answer the question it retries once with a different query, and otherwise says so. |
+| **Chatbot** | Ask questions of your documents or of your tables. A new chat starts with *Search in*: **Documents** (an experiment with a BM25 vector; the answer is written from the top chunks of a hybrid search with reranking, with `[n]` citations) or **Database** (a schema of imported tables; the model writes a SELECT, it is checked and run read-only, and the answer is written from the rows, with the SQL shown under it; click **Good answer** under one that is right and it is kept as an example the model is shown for similar questions later). The choice is fixed for the whole chat: to search somewhere else, start a new chat. The page shows what happens as it happens: each step, the model's thinking, the retrieved chunks and scores, how full the model's context is, and how long each step took. If the documents do not answer the question it retries once with a different query, and otherwise says so. |
+| **Database** | Import CSV files into a schema of the database for imported tables (UTF-8, first row the header, up to 50 MB and 1,000,000 rows each). Each file shows a preview and the column types it guessed, which you can change, and a table name. A bad row stops the import and leaves nothing behind. Below, what each table holds (with descriptions you can write), what the model is given about the schema, the good answers saved for it (turn one off or delete it), and deletes for a table or a schema. |
 | **Benchmark** | Runs one document through every chosen embedding model, chunking strategy and search strategy, and saves a report with a PDF download. |
 
 ## Batch ingestion with Dagster
@@ -75,7 +76,10 @@ Drop PDFs in `data/raw/`. A sensor registers each as a Dagster partition (its id
 docker compose exec dagster-code python -m rag_lab.search "query text" --experiment <name> --top-k 5
 
 # the chatbot, with every step printed (no question = a chat loop that keeps history)
-docker compose exec dagster-code python -m rag_lab.agent "question" --experiment <name>
+docker compose exec dagster-code python -m rag_lab.agent documents "question" --experiment <name>
+
+# the text-to-SQL agent over a schema of imported tables, every step printed
+docker compose exec dagster-code python -m rag_lab.agent sql "question" --schema <name>
 ```
 
 `notebook/search.ipynb` runs searches from a notebook with `rag_lab.search.quick.ask`.
@@ -100,7 +104,7 @@ src/rag_lab/
   config.py       experiment, search and agent settings (also Dagster run config)
   ingest.py       the stage bodies shared by Dagster, the Upload page and the benchmark
   parsing/  chunking/  embedding/  reranking/  storage/  search/
-  agent/          the chatbot: graph.py, events.py, model.py, prompts.py, a CLI
+  agent/          the chatbot: shared events, model and runner; documents/ is the flow for documents; a CLI per flow
   benchmark/      runner, report data, PDF
   metrics/        timings, retrieval metrics, the Postgres store and its migrations
   assets/         Dagster assets, jobs and the sensor

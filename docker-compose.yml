@@ -8,6 +8,9 @@ x-dagster-env: &dagster-env
   NLTK_DATA: /root/.cache/nltk_data
   QDRANT_URL: http://qdrant:6333
   METRICS_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/rag_metrics
+  # The database for imported tables: one role loads data, one only reads (see src/rag_lab/sql/).
+  SQL_LOADER_URL: postgresql://rag_loader:${SQL_LOADER_PASSWORD}@postgres:5432/rag_data
+  SQL_READER_URL: postgresql://rag_reader:${SQL_READER_PASSWORD}@postgres:5432/rag_data
 
 services:
   postgres:

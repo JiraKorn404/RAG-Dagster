@@ -39,6 +39,51 @@ class Rewrote:
 
 
 @dataclass
+class SchemaShown:
+    """What the text-to-SQL flow gives the model: every table of the schema, and how long that text is."""
+
+    tables: list[str]
+    chars: int
+    text: str = ""  # the text itself, as the model saw it
+
+
+@dataclass
+class ExamplesFound:
+    """Good answers to similar questions that were put in front of the model. Empty when the schema has
+    examples but none was similar enough."""
+
+    examples: list[dict]  # each: id, question, sql, score
+
+
+@dataclass
+class SqlWritten:
+    sql: str  # what the model wrote, as it wrote it
+    attempt: int  # 1 for the first query, 2 for the first repair
+
+
+@dataclass
+class SqlChecked:
+    ok: bool
+    sql: str  # what will run when ok (schema-qualified, with its limit), else what was refused
+    reason: str = ""  # why not, worded for the model
+
+
+@dataclass
+class SqlRan:
+    columns: list[str]
+    rows: list[list]  # the first `ROWS_KEPT` of them
+    row_count: int  # how many were read (at most the row limit)
+    truncated: bool  # there were more
+    ms: float
+
+
+@dataclass
+class Repairing:
+    error: str  # what the guard or the database said about the query
+    attempt: int  # the repair that follows: 1 for the first
+
+
+@dataclass
 class Retrieved:
     hits: list[Hit]
     method: str
@@ -84,17 +129,22 @@ class Done:
     abstained: bool = False  # the chunks did not answer it, so the answer is the fixed "not found" message
     saved: bool = True  # false when saving the turn failed; the answer is still good
     save_error: str | None = None
+    turn_id: int | None = None  # the saved turn, when it was saved
 
+
+ROWS_KEPT = 100  # rows of a result kept in a turn's events
 
 Event = (
     StepStarted | StepFinished | Query | Graded | Rewrote | Retrieved | Thinking | AnswerToken | ModelState | Done
+    | SchemaShown | ExamplesFound | SqlWritten | SqlChecked | SqlRan | Repairing
 )
 
 
 _TYPES = {
     cls.__name__: cls
     for cls in (
-        StepStarted, StepFinished, Query, Graded, Rewrote, Retrieved, Thinking, AnswerToken, ModelState, Done
+        StepStarted, StepFinished, Query, Graded, Rewrote, Retrieved, Thinking, AnswerToken, ModelState, Done,
+        SchemaShown, ExamplesFound, SqlWritten, SqlChecked, SqlRan, Repairing,
     )
 }
 

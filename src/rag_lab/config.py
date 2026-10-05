@@ -117,19 +117,24 @@ class SearchConfig(_Section):
         return self.method.endswith("+rerank")
 
 
-class AgentConfig(_Section):
-    """The chatbot agent. Not part of ExperimentConfig or its hash: it changes how an experiment is
-    asked, not what is stored in it."""
+class ChatModelConfig(_Section):
+    """What every chatbot flow shares: the chat model and how it is called."""
 
     model: str = "gemma4:e4b-mlx"
     temperature: float = 0.2
     # Ollama's own default window is small and silently cuts a long prompt, so it is always set. The
-    # prompt is the instructions, the history, the retrieved chunks and, when `think` is on, the thinking.
+    # prompt is the instructions, the history, what the flow retrieved and, when `think` is on, the thinking.
     num_ctx: int = 8192
     think: bool = True  # the answer is written with the model's thinking on; the other steps never think
     keep_alive: str = "30m"
-    top_k: int = 5  # chunks given to the model
     history_turns: int = 6  # earlier question-and-answer pairs the question is condensed with
+
+
+class AgentConfig(ChatModelConfig):
+    """The chatbot agent for documents. Not part of ExperimentConfig or its hash: it changes how an
+    experiment is asked, not what is stored in it."""
+
+    top_k: int = 5  # chunks given to the model
     # Judging the retrieval by the best chunk's reranker score (a probability of "yes"): at or above
     # `enough_score` the chunks answer it, below `missing_score` they do not, and in between the model is
     # asked. Chosen on one document: questions it answers scored 0.99 or more, questions it does not
@@ -139,6 +144,45 @@ class AgentConfig(_Section):
     max_rewrites: int = 1  # different queries tried when the chunks do not answer it, before giving up
     # How the documents are searched. The 4B reranker works; the 0.6B builds give every chunk 0.0.
     search: SearchConfig = SearchConfig(method="hybrid+rerank", reranker="dengcao/Qwen3-Reranker-4B:Q8_0")
+
+
+class SqlAgentConfig(ChatModelConfig):
+    """The chatbot agent for a database schema (text-to-SQL). Not part of any experiment hash."""
+
+    # Exact answers want no randomness, and the prompt (the whole schema, the repairs, the rows and, when
+    # `think` is on, the thinking) is longer than a documents prompt.
+    temperature: float = 0.0
+    num_ctx: int = 16384
+    # The model is given the description of every table in the schema. A schema whose description is
+    # longer than this is refused with its size, not cut: a silently cut schema gives silently wrong SQL.
+    schema_char_budget: int = 12_000
+    max_repairs: int = 2  # a query the guard or the database refused is rewritten this many times
+    row_limit: int = 200  # rows a query may return; more are cut, and the answer says so
+    answer_rows: int = 30  # rows given to the model to write the answer from
+    statement_timeout_s: float = 10
+    # Good answers (rag_lab/sql/examples.py): a question like the one asked, answered correctly before, is
+    # shown to the model with its SQL. They are found by the similarity of the questions (cosine, from
+    # qwen3-embedding:0.6b). On six saved examples the best match scored 0.56 to 0.78 for a paraphrase or the
+    # same kind of question, 0.36 to 0.67 for another kind of question about the same table, and 0.26 to 0.51
+    # for an unrelated one; 0.55 is the gap between the last and the first.
+    use_examples: bool = True
+    examples_k: int = 3
+    examples_min_score: float = 0.55
+    embed: EmbedConfig = EmbedConfig(
+        query_instruction="Given a question about a dataset, retrieve questions that ask for the same kind of information"
+    )
+
+
+class ImportConfig(_Section):
+    """Importing a CSV file into the database for imported tables."""
+
+    max_bytes: int = 50 * 1024 * 1024
+    max_rows: int = 1_000_000
+    sample_rows: int = 10_000  # rows read to guess the column types
+    sample_bytes: int = 4 * 1024 * 1024  # the start of the file that is read for that
+    preview_rows: int = 20
+    sample_values: int = 10  # example values kept for a text column with few distinct values
+    max_distinct_for_samples: int = 50
 
 
 class ExperimentConfig(_Section):

@@ -4,37 +4,48 @@ import uuid
 import data
 import streamlit as st
 import style
-from hits import hit_card
+from trace_view import (
+    STEP_NAMES,
+    apply,
+    attempt_lines,
+    example_of,
+    history_of,
+    messages_from,
+    new_trace,
+    show_answer,
+    show_trace,
+    sql_attempt_lines,
+)
 
-from rag_lab.agent import build_graph, run
+from rag_lab.agent import run
+from rag_lab.agent.documents import DocumentsFlow, build_graph
 from rag_lab.agent.events import (
     AnswerToken,
-    Done,
+    ExamplesFound,
     Graded,
-    ModelState,
     Query,
+    Repairing,
     Retrieved,
     Rewrote,
+    SchemaShown,
+    SqlChecked,
+    SqlRan,
+    SqlWritten,
     StepStarted,
     Thinking,
-    citations,
-    from_dict,
 )
-from rag_lab.config import AgentConfig, ExperimentConfig, SearchConfig
+from rag_lab.agent.sql import SqlFlow
+from rag_lab.agent.sql import build_graph as build_sql_graph
+from rag_lab.config import AgentConfig, ExperimentConfig, SearchConfig, SqlAgentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.metrics.store import MetricsStore
 from rag_lab.reranking import OllamaReranker
-from rag_lab.search import Hit
+from rag_lab.sql import examples as good_answers
 from rag_lab.storage.qdrant import QdrantStore
 
-STEP_NAMES = {
-    "condense": "Reading the question",
-    "retrieve": "Searching",
-    "grade": "Checking the chunks",
-    "rewrite": "Trying a different query",
-    "generate": "Writing the answer",
-    "abstain": "Not found",
-}
+# A chat searches one kind of thing for its whole life, chosen before its first question.
+SOURCES = {"documents": "Documents (vector database)", "database": "Database (tables)"}
+ICONS = {"documents": ":material/description:", "database": ":material/database:"}
 
 
 @st.cache_resource
@@ -87,171 +98,31 @@ def delete_chat(chat_id: str) -> None:
     new_chat()
 
 
-def new_trace(question: str, settings: dict | None) -> dict:
-    return {
-        "question": question, "settings": settings, "attempts": [], "retrieved": None,
-        "thinking": "", "states": [], "done": None, "error": None,
-    }
-
-
-def apply(trace: dict, event) -> None:
-    """Fold one event into what is shown for a turn. A live answer and a saved turn both go through here."""
-    if isinstance(event, (Query, Rewrote)):
-        query = event.text if isinstance(event, Query) else event.query
-        trace["attempts"].append({"query": query, "retrieved": None, "graded": None})
-    elif isinstance(event, Graded):
-        trace["attempts"][-1]["graded"] = event
-    elif isinstance(event, Retrieved):
-        trace["retrieved"] = trace["attempts"][-1]["retrieved"] = event
-    elif isinstance(event, Thinking):
-        trace["thinking"] += event.text
-    elif isinstance(event, ModelState):
-        trace["states"].append(event)
-    elif isinstance(event, Done):
-        trace["done"], trace["thinking"] = event, event.thinking
-
-
-def trace_from_turn(turn: dict) -> dict:
-    """What is shown for a saved turn. A turn saved before its events were kept is rebuilt from its
-    columns: one search, with no times for it and no verdict."""
-    settings = turn["settings"] or {"model": turn["model"], "think": turn["think"]}
-    trace = new_trace(turn["question"], settings)
-    if turn["events"] is not None:
-        for saved in turn["events"]:
-            apply(trace, from_dict(saved))
-        trace["error"] = turn["error"]
-        return trace
-    hits = [Hit(**h) for h in turn["hits"]]
-    cited, unknown = citations(turn["answer"], len(hits))
-    events = [
-        Query(turn["query"], rewritten=turn["query"] != turn["question"]),
-        Retrieved(hits=hits, method="", candidates=0, embed_ms=0.0, search_ms=0.0, rerank_ms=0.0),
-        *[ModelState(**s) for s in turn["model_states"]],
-        Done(turn["answer"], turn["thinking"], cited, unknown, turn["timings"], sum(turn["timings"].values())),
-    ]
-    for event in events:
-        apply(trace, event)
-    return trace
-
-
-def messages_from(turns: list[dict]) -> list[dict]:
-    messages = []
-    for turn in turns:
-        messages += [
-            {"role": "user", "content": turn["question"]},
-            {"role": "assistant", "trace": trace_from_turn(turn)},
-        ]
-    return messages
-
-
-def history_of(messages: list[dict]) -> list[tuple[str, str]]:
-    """The answered turns as the agent's history; a failed turn has no answer to remember."""
-    history = []
-    for user, assistant in zip(messages[::2], messages[1::2]):
-        if not assistant["trace"]["error"]:
-            history += [("User", user["content"]), ("Assistant", assistant["trace"]["done"].answer)]
-    return history
-
-
 def where(hit) -> str:
     name = hit.source_file or hit.doc_id
     return f"{name}, p. {hit.page}" if hit.page else name
 
 
-def state_line(s: ModelState) -> str:
-    loaded = {True: "already loaded", False: "had to be loaded", None: "load state unknown"}[s.loaded]
-    speed = f" · {s.tokens_per_s:.1f} tok/s" if s.tokens_per_s else ""
-    return (
-        f"**{STEP_NAMES[s.node]}** · {s.model} ({loaded}) · thinking {'on' if s.think else 'off'} · "
-        f"{s.prompt_tokens} of {s.num_ctx} context in, {s.output_tokens} out{speed}"
-    )
-
-
-def settings_line(settings: dict | None) -> str:
-    """What a turn ran with; a turn saved before the settings were kept only has the model."""
-    if not settings:
-        return ""
-    search = settings.get("search") or {}
-    parts = [settings.get("model"), f"thinking {'on' if settings.get('think') else 'off'}"]
-    if search:
-        parts += [
-            search["method"].replace("+", " + "),
-            search["reranker"],
-            f"{search['candidates']} candidates",
-            f"top {settings['top_k']}",
-            f"context {settings['num_ctx']}",
-        ]
-    return "Settings: " + ", ".join(str(p) for p in parts)
-
-
-def verdict(graded: Graded | None) -> str:
-    if not graded:
-        return ""
-    answers = "the chunks answer it" if graded.enough else "the chunks do not answer it"
-    return f" — best score {graded.best_score:.3f}, {answers} (decided by the {graded.by})"
-
-
-def attempt_lines(trace: dict) -> str:
-    return "\n".join(
-        f"{n}. **Searched for:** {a['query']}{verdict(a['graded'])}" for n, a in enumerate(trace["attempts"], start=1)
-    )
-
-
-def show_answer(done: Done) -> None:
-    (st.info if done.abstained else st.markdown)(done.answer)
-
-
-def show_trace(trace: dict) -> None:
-    """Everything the agent did for one answer."""
-    done, retrieved = trace["done"], trace["retrieved"]
-    with st.expander("How this was answered"):
-        steps, thinking, chunks = st.tabs(
-            ["Steps and model", "Thinking", f"Retrieved chunks ({len(retrieved.hits) if retrieved else 0})"]
-        )
-        with steps:
-            st.markdown(f"**Question:** {trace['question']}")
-            if trace["attempts"]:
-                st.markdown(attempt_lines(trace))
-            if done:
-                rows = "".join(f"| {STEP_NAMES[node]} | {ms:.0f} ms |\n" for node, ms in done.timings.items())
-                st.markdown(f"| Step | Time |\n|---|---|\n{rows}| **Total** | **{done.total_ms:.0f} ms** |")
-            if retrieved and retrieved.method:
-                st.caption(
-                    f"Search: {retrieved.method.replace('+', ' + ')}, {retrieved.candidates} candidates. "
-                    f"Embedding the query {retrieved.embed_ms:.0f} ms, Qdrant {retrieved.search_ms:.0f} ms, "
-                    f"reranking {retrieved.rerank_ms:.0f} ms."
-                )
-            for s in trace["states"]:
-                st.markdown(state_line(s))
-                if s.context_full:
-                    st.warning("The prompt filled the context window, so Ollama cut it. Raise `num_ctx`.")
-            if done and done.unknown_citations:
-                st.warning(f"The answer cites passage(s) {done.unknown_citations}, which do not exist.")
-            if trace["settings"]:
-                st.caption(settings_line(trace["settings"]))
-        with thinking:
-            if trace["thinking"]:
-                st.markdown(trace["thinking"])
-            else:
-                st.caption("The model did not think for this answer.")
-        with chunks:
-            if not retrieved or not retrieved.hits:
-                st.caption("Nothing was retrieved.")
-            else:
-                st.caption("The number on a card is the passage number the answer cites. Score: the reranker's probability that the chunk answers the question.")
-                cited = done.cited if done else []
-                st.markdown(
-                    "".join(hit_card(h, style.MODEL_COLORS[0], cited=h.rank in cited) for h in retrieved.hits),
-                    unsafe_allow_html=True,
-                )
+def database_progress(trace: dict) -> str:
+    """What a database turn has done so far, for the status panel."""
+    parts = []
+    if trace["rewritten"]:
+        parts.append(f"**Understood as:** {trace['standalone']}")
+    if trace["schema"]:
+        parts.append(f"**Schema:** {len(trace['schema'].tables)} table(s), {trace['schema'].chars:,} characters")
+    if trace["examples"]:
+        parts.append(f"**Similar good answers shown to the model:** {len(trace['examples'])}")
+    if trace["sql_attempts"]:
+        parts.append(sql_attempt_lines(trace))
+    return "\n\n".join(parts)
 
 
 def answer_turn(
-    question: str, graph, experiment: ExperimentConfig, cfg: AgentConfig, metrics: MetricsStore,
-    chat_id: str, history: list[tuple[str, str]],
+    question: str, graph, flow, metrics: MetricsStore, chat_id: str, history: list[tuple[str, str]],
 ) -> dict:
     """Run one question, drawing each step as it happens. Returns what is shown for the turn."""
-    trace = new_trace(question, cfg.model_dump(mode="json"))
+    kind = flow.kind
+    trace = new_trace(question, flow.cfg.model_dump(mode="json"), kind)
     live, box = st.empty(), st.empty()
     text, step = "", "starting"
     with live.container():
@@ -259,11 +130,22 @@ def answer_turn(
         with status:
             attempts_box, chunks_box, thinking_box = st.empty(), st.empty(), st.empty()
     try:
-        for event in run(graph, experiment, question, history, cfg=cfg, metrics=metrics, session_id=chat_id):
+        for event in run(graph, flow, question, history, metrics=metrics, session_id=chat_id):
             apply(trace, event)
             if isinstance(event, StepStarted):
                 step = event.node
-                status.update(label=STEP_NAMES[step] + ("…" if step != "retrieve" else f" (hybrid, {cfg.search.candidates} candidates, then reranking)…"))
+                label = STEP_NAMES[step] + "…"
+                if step == "retrieve":
+                    label = f"{STEP_NAMES[step]} (hybrid, {flow.cfg.search.candidates} candidates, then reranking)…"
+                status.update(label=label)
+            elif isinstance(event, Thinking):
+                thinking_box.markdown(f"**Thinking**\n\n{trace['thinking']}")
+            elif isinstance(event, AnswerToken):
+                text += event.text
+                box.markdown(text + " ▌")
+            elif kind == "database":
+                if isinstance(event, (Query, SchemaShown, ExamplesFound, SqlWritten, SqlChecked, SqlRan, Repairing)):
+                    attempts_box.markdown(database_progress(trace))
             elif isinstance(event, (Query, Rewrote, Graded)):
                 attempts_box.markdown(attempt_lines(trace))
             elif isinstance(event, Retrieved):
@@ -273,49 +155,54 @@ def answer_turn(
                         for h in event.hits
                     )
                 )
-            elif isinstance(event, Thinking):
-                thinking_box.markdown(f"**Thinking**\n\n{trace['thinking']}")
-            elif isinstance(event, AnswerToken):
-                text += event.text
-                box.markdown(text + " ▌")
     except Exception as e:  # noqa: BLE001  (Ollama or Qdrant not reachable: show where it failed, do not crash)
         trace["error"] = f"{STEP_NAMES.get(step, 'Starting')} failed: {e}"
         status.update(label=trace["error"], state="error")
         return trace
     live.empty()
     with box.container():
-        show_answer(trace["done"])
+        show_answer(trace)
     return trace
 
 
-style.hero("Chatbot", "Ask about the documents in an experiment and see how each answer was found")
+style.hero("Chatbot", "Ask questions of your documents or your tables, and see how each answer was found")
 
-available = experiments()
 rerankers = data.reranker_models()
 chat_models = data.chat_models()
-if not available:
-    st.info("No experiment with a BM25 vector exists yet. On the Upload page, tick the BM25 box when embedding a document.")
-    st.stop()
-if not rerankers or not chat_models:
-    st.info("Ollama has no " + ("reranker" if not rerankers else "chat model that can use tools") + " installed, so the chatbot cannot run.")
+if not chat_models:
+    st.info("Ollama has no chat model that can use tools installed, so the chatbot cannot run.")
     st.stop()
 
 embedder, qdrant, metrics, reranker = services()
+available = experiments()
 by_name = {row["name"]: row for row in available}
+schemas = metrics.list_db_schemas()
+schema_by_name = {s["name"]: s for s in schemas}
 
-# Which chat is this? The id in the URL, or a new one. A chat belongs to the experiment it started in.
+# Which chat is this? The id in the URL, or a new one. A chat searches the one thing it started with.
 chat_id = st.query_params.get("chat")
 session = metrics.get_chat_session(chat_id) if chat_id else None
-owner = next((r for r in available if session and r["config_hash"] == session["config_hash"]), None)
-if session and not owner:
-    st.warning("That chat belongs to an experiment that is not available here, so a new chat was started.")
-    chat_id = None
+owner = None
+if session:
+    if session["kind"] == "documents":
+        found = next((r for r in available if r["config_hash"] == session["config_hash"]), None)
+        owner = found["name"] if found else None
+    else:
+        owner = session["schema_name"] if session["schema_name"] in schema_by_name else None
+    if owner is None:
+        st.warning("That chat searches something that is not available here, so a new chat was started.")
+        chat_id, session = None, None
 if not chat_id:
     chat_id = new_chat()
-elif owner:
-    st.session_state["experiment"] = owner["name"]
-if st.session_state.get("experiment") not in by_name:
-    st.session_state.pop("experiment", None)
+locked = session is not None  # a chat that has a turn keeps what it searches
+if locked:
+    st.session_state["source"] = SOURCES[session["kind"]]
+    st.session_state["experiment" if session["kind"] == "documents" else "schema"] = owner
+elif st.session_state.get("source") not in SOURCES.values():
+    st.session_state["source"] = SOURCES["documents" if available or not schemas else "database"]
+for key, valid in (("experiment", by_name), ("schema", schema_by_name)):
+    if st.session_state.get(key) not in valid:
+        st.session_state.pop(key, None)
 
 if st.session_state.get("loaded_chat") != chat_id:
     st.session_state["messages"] = messages_from(metrics.get_chat_turns(chat_id))
@@ -323,37 +210,85 @@ if st.session_state.get("loaded_chat") != chat_id:
 
 defaults = AgentConfig()
 models = list(chat_models)
+target = None  # the experiment (a row) or the schema (its name) this chat searches
 with st.sidebar:
     st.subheader("Chat settings")
-    name = st.selectbox("Experiment", list(by_name), key="experiment", format_func=lambda n: describe(by_name[n]), on_change=new_chat, help="Changing it starts a new chat: a chat belongs to one experiment.")
-    row = by_name[name]
+    source = st.radio("Search in", list(SOURCES.values()), key="source", disabled=locked, help="Chosen before the first question, and fixed for the whole chat.")
+    kind = next(k for k, label in SOURCES.items() if label == source)
+    if locked:
+        what = "the documents of" if kind == "documents" else "the tables of the schema"
+        st.caption(f"This chat searches {what} `{owner}`. Start a new chat to search somewhere else.")
+    if kind == "documents":
+        if available:
+            name = st.selectbox("Experiment", list(by_name), key="experiment", format_func=lambda n: describe(by_name[n]), disabled=locked)
+            target = by_name[name]
+        else:
+            st.info("No experiment with a BM25 vector exists yet. On the Upload page, tick the BM25 box when embedding a document.")
+        if not rerankers:
+            st.info("Ollama has no reranker installed, so documents cannot be searched.")
+            target = None
+    elif schemas:
+        target = st.selectbox("Schema", list(schema_by_name), key="schema", format_func=lambda n: f"{n} · {schema_by_name[n]['tables']} table(s)", disabled=locked)
+    else:
+        st.info("No schema exists yet. Import a CSV file on the Database page.")
     model = st.selectbox("Chat model", models, index=models.index(defaults.model) if defaults.model in models else 0)
-    think = st.toggle("Thinking", value=defaults.think and chat_models[model], disabled=not chat_models[model], help="The model thinks before it answers, and the page shows it. Slower.")
-    rerank_model = st.selectbox("Reranker", rerankers, index=rerankers.index(defaults.search.reranker) if defaults.search.reranker in rerankers else 0)
-    top_k = st.slider("Chunks given to the model (top k)", 1, 10, defaults.top_k)
-    candidates = int(st.number_input("Candidates", min_value=1, max_value=100, value=defaults.search.candidates, help="Hits the reranker scores; one call to Ollama each."))
-    st.caption("Search: hybrid (dense and BM25 keywords) with reranking.")
+    think = st.toggle("Thinking", value=defaults.think and chat_models[model], disabled=not chat_models[model], help="The model thinks before it answers (or, for a database, before it writes the SQL), and the page shows it. Slower.")
+    if kind == "documents":
+        rerank_model = st.selectbox("Reranker", rerankers or ["none installed"], index=rerankers.index(defaults.search.reranker) if defaults.search.reranker in rerankers else 0)
+        top_k = st.slider("Chunks given to the model (top k)", 1, 10, defaults.top_k)
+        candidates = int(st.number_input("Candidates", min_value=1, max_value=100, value=defaults.search.candidates, help="Hits the reranker scores; one call to Ollama each."))
+        st.caption("Search: hybrid (dense and BM25 keywords) with reranking.")
+    else:
+        st.caption("The model is given the whole schema, writes one SELECT, and a check and the database confirm it before it runs, read-only.")
     st.button("New chat", on_click=new_chat, width="stretch")
     if st.session_state["messages"]:
         with st.popover("Delete this chat", width="stretch"):
             st.write("This deletes the chat and all its turns.")
             st.button("Yes, delete it", on_click=delete_chat, args=(chat_id,), key="delete-chat")
-    past = metrics.list_chat_sessions(row["config_hash"])
+    past = metrics.list_chat_sessions()
     if past:
         st.subheader("Past chats")
         for s in past:
-            title = s["title"] if len(s["title"]) <= 40 else s["title"][:40] + "…"
+            title = s["title"] if len(s["title"]) <= 34 else s["title"][:34] + "…"
+            what = "Documents" if s["kind"] == "documents" else "Database"
             st.button(
                 f"{title} · {s['turns']}",
                 key=f"chat-{s['session_id']}",
+                icon=ICONS[s["kind"]],
                 on_click=open_chat,
                 args=(s["session_id"],),
                 type="primary" if s["session_id"] == chat_id else "secondary",
                 width="stretch",
-                help=f"{s['turns']} turn(s), last used {s['updated_at']:%d %b %Y %H:%M} UTC",
+                help=f"{what}: {s['target']}. {s['turns']} turn(s), last used {s['updated_at']:%d %b %Y %H:%M} UTC",
             )
 
-for message in st.session_state["messages"]:
+def mark_good(trace: dict, schema: str, saved: dict, pair: tuple[str, str], key: str) -> None:
+    """The thumbs-up under a database answer: save the question and its SQL as an example, or, when it is
+    already saved and on, take it away again."""
+    existing = saved.get(pair)
+    pressed = existing is not None and existing["enabled"]
+    if st.button(
+        "Marked as a good answer" if pressed else "Good answer",
+        key=key,
+        icon=":material/thumb_up:",
+        type="primary" if pressed else "secondary",
+        help="Click to remove it from the examples." if pressed else "Keep this question and its SQL as an example for similar questions.",
+    ):
+        try:
+            if pressed:
+                good_answers.remove(metrics, qdrant, schema, existing["id"])
+            else:
+                good_answers.save(metrics, embedder, qdrant, SqlAgentConfig(), schema, trace["question"], pair[0], pair[1], trace["turn_id"])
+        except Exception as e:  # noqa: BLE001  (Ollama or Qdrant down: the table may be ahead of the index; `examples --reindex` fixes it)
+            st.error(f"Could not change the example: {e}")
+        else:
+            st.rerun()
+
+
+saved_examples = (
+    {(e["standalone"], e["sql"]): e for e in metrics.list_sql_examples(owner)} if locked and kind == "database" else {}
+)
+for index, message in enumerate(st.session_state["messages"]):
     with st.chat_message(message["role"]):
         if message["role"] == "user":
             st.markdown(message["content"])
@@ -362,25 +297,38 @@ for message in st.session_state["messages"]:
         if trace["error"]:
             st.error(trace["error"])
         else:
-            show_answer(trace["done"])
+            show_answer(trace)
+        if locked and kind == "database" and (pair := example_of(trace)):
+            mark_good(trace, owner, saved_examples, pair, f"good-{chat_id}-{index}")
         show_trace(trace)
         if trace["done"] and not trace["done"].saved:
             st.warning(f"This turn was not saved to the database: {trace['done'].save_error}")
 
-question = st.chat_input("Ask a question about the documents")
+if target is None:
+    st.info("Choose what to search in the sidebar." if not locked else "What this chat searches is not available.")
+    st.stop()
+
+question = st.chat_input("Ask a question about the documents" if kind == "documents" else "Ask a question about the tables")
 if question and question.strip():
     with st.chat_message("user"):
         st.markdown(question)
-    experiment = ExperimentConfig.model_validate(row["config"])
-    cfg = AgentConfig(
-        model=model,
-        think=think,
-        top_k=top_k,
-        search=SearchConfig(method="hybrid+rerank", reranker=rerank_model, candidates=candidates),
-    )
-    graph = build_graph(experiment, embedder, qdrant, reranker, os.environ["OLLAMA_BASE_URL"], cfg)
+    base_url = os.environ["OLLAMA_BASE_URL"]
+    if kind == "documents":
+        experiment = ExperimentConfig.model_validate(target["config"])
+        cfg = AgentConfig(
+            model=model,
+            think=think,
+            top_k=top_k,
+            search=SearchConfig(method="hybrid+rerank", reranker=rerank_model, candidates=candidates),
+        )
+        graph = build_graph(experiment, embedder, qdrant, reranker, base_url, cfg)
+        flow = DocumentsFlow(experiment, cfg)
+    else:
+        cfg = SqlAgentConfig(model=model, think=think)
+        graph = build_sql_graph(metrics, target, base_url, cfg, embedder, qdrant)
+        flow = SqlFlow(target, cfg)
     with st.chat_message("assistant"):
-        trace = answer_turn(question, graph, experiment, cfg, metrics, chat_id, history_of(st.session_state["messages"]))
+        trace = answer_turn(question, graph, flow, metrics, chat_id, history_of(st.session_state["messages"]))
     st.session_state["messages"] += [
         {"role": "user", "content": question},
         {"role": "assistant", "trace": trace},

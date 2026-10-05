@@ -14,7 +14,7 @@ from pathlib import Path
 from rag_lab.config import NAME_PATTERN
 from rag_lab.metrics.store import MetricsStore
 from rag_lab.paths import DATA_DIR
-from rag_lab.storage.qdrant import QdrantStore
+from rag_lab.storage.qdrant import SQL_EXAMPLES_PREFIX, QdrantStore
 
 ARTIFACT_STAGES = ("parse", "chunk", "embed")
 
@@ -33,7 +33,9 @@ def list_library(metrics: MetricsStore, qdrant: QdrantStore) -> list[dict]:
     """Every experiment with its documents, newest first, then the collections that have no experiment
     row. Each entry: name, config (None without a row), has_row, has_collection, documents (name, id,
     points, ingested_at), points, in_report, created_at."""
-    collections = {c.name for c in qdrant.client.get_collections().collections}
+    collections = {
+        c.name for c in qdrant.client.get_collections().collections if not c.name.startswith(SQL_EXAMPLES_PREFIX)
+    }
     entries = []
     for row in sorted(metrics.list_experiments(), key=lambda r: r["created_at"], reverse=True):
         present = row["name"] in collections

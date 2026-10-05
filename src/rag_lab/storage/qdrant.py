@@ -24,6 +24,7 @@ from qdrant_client.models import (
 from rag_lab.config import IndexConfig
 
 PAYLOAD_INDEXES = ("doc_id", "modality", "source_file")
+SQL_EXAMPLES_PREFIX = "sqlexamples__"  # collections of good answers: not experiments
 SPARSE_VECTOR = "bm25"  # the name of the sparse vector; the dense one stays unnamed
 _NAMESPACE = uuid.UUID("6f1d3a52-6d0b-4e0e-9a43-5b7d1c1f0a11")
 

@@ -24,6 +24,7 @@ from rag_lab.config import (
     EmbedConfig,
     ExperimentConfig,
     HybridSettings,
+    IndexConfig,
     RecursiveSettings,
     SemanticSettings,
 )
@@ -111,6 +112,11 @@ strategy = c1.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index(ChunkConf
 max_tokens = c2.number_input("Max tokens", min_value=32, max_value=8192, value=ChunkConfig().max_tokens, step=32)
 table_handling = c3.selectbox("Tables", ["markdown", "row-wise", "skip"], help="`row-wise` is not supported by hybrid and hierarchical (they fall back to markdown).")
 include_headings = st.checkbox("Add the headings to each chunk's text", value=ChunkConfig().include_headings_in_text)
+sparse = st.checkbox(
+    "Add a BM25 keyword vector (needed for hybrid search)",
+    value=IndexConfig().sparse,
+    help="Keyword search over the same chunks, stored next to the embedding. Costs a little extra index time. It cannot be added to an experiment later.",
+)
 
 overlap, merge_peers = 0, HybridSettings().merge_peers
 separators = RecursiveSettings().separators
@@ -162,6 +168,7 @@ def build_config(name: str, tag: str | None = None) -> ExperimentConfig:
             recursive=RecursiveSettings(separators=separators),
             semantic=semantic,
         ),
+        index=IndexConfig(sparse=sparse),
     )
 
 

@@ -20,6 +20,8 @@ dependencies = [
     "ipykernel>=7.4.0",
     "streamlit",
     "reportlab",
+    "langgraph",
+    "langchain-ollama",
 ]
 
 [dependency-groups]

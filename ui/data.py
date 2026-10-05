@@ -62,3 +62,15 @@ def reranker_models() -> list[str]:
         for m in _ollama_models()
         if "reranker" in m["name"].lower() and "completion" in m.get("capabilities", ["completion"])
     )
+
+
+@st.cache_data(ttl=60)
+def chat_models() -> dict[str, bool]:
+    """The models Ollama has that can chat with tools (the chatbot's model), each with whether it can
+    think. Rerankers are left out: they also report these capabilities but only answer yes or no."""
+    return {
+        m["name"]: "thinking" in m["capabilities"]
+        for m in _ollama_models()
+        if {"completion", "tools"} <= set(m.get("capabilities", []))
+        and "reranker" not in m["name"].lower()
+    }

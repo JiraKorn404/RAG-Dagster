@@ -99,7 +99,7 @@ class SearchConfig(_Section):
     # What the first stage hands on: each branch of a hybrid search fetches this many hits, and a
     # reranker scores this many. At least top k is always fetched.
     candidates: int = 20
-    reranker: str = "dengcao/Qwen3-Reranker-4B:Q4_K_M"
+    reranker: str = "dengcao/Qwen3-Reranker-0.6B:Q4_K_M"
     rerank_instruction: str = (
         "Given a question, retrieve relevant passages from the documents that answer it"
     )
@@ -115,6 +115,30 @@ class SearchConfig(_Section):
     @property
     def rerank(self) -> bool:
         return self.method.endswith("+rerank")
+
+
+class AgentConfig(_Section):
+    """The chatbot agent. Not part of ExperimentConfig or its hash: it changes how an experiment is
+    asked, not what is stored in it."""
+
+    model: str = "gemma4:e4b-mlx"
+    temperature: float = 0.2
+    # Ollama's own default window is small and silently cuts a long prompt, so it is always set. The
+    # prompt is the instructions, the history, the retrieved chunks and, when `think` is on, the thinking.
+    num_ctx: int = 8192
+    think: bool = True  # the answer is written with the model's thinking on; the other steps never think
+    keep_alive: str = "30m"
+    top_k: int = 5  # chunks given to the model
+    history_turns: int = 6  # earlier question-and-answer pairs the question is condensed with
+    # Judging the retrieval by the best chunk's reranker score (a probability of "yes"): at or above
+    # `enough_score` the chunks answer it, below `missing_score` they do not, and in between the model is
+    # asked. Chosen on one document: questions it answers scored 0.99 or more, questions it does not
+    # cover 0.0 to 0.05 (carburetor icing, which it never mentions, 0.051).
+    enough_score: float = 0.5
+    missing_score: float = 0.1
+    max_rewrites: int = 1  # different queries tried when the chunks do not answer it, before giving up
+    # How the documents are searched. The 4B reranker works; the 0.6B builds give every chunk 0.0.
+    search: SearchConfig = SearchConfig(method="hybrid+rerank", reranker="dengcao/Qwen3-Reranker-4B:Q8_0")
 
 
 class ExperimentConfig(_Section):

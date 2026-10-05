@@ -104,6 +104,28 @@ class MetricsStore:
             (config_hash, query_text, top_k, embed_ms, search_ms, total_ms, top_similarity),
         )
 
+    def add_chat_turn(
+        self,
+        config_hash: str,
+        session_id: str,
+        question: str,
+        query: str,
+        model: str,
+        think: bool,
+        answer: str,
+        thinking: str,
+        hits: list[dict],
+        timings: dict,
+        model_states: list[dict],
+    ) -> None:
+        self._execute(
+            """INSERT INTO chat_turns (config_hash, session_id, question, query, model, think, answer,
+                                       thinking, hits, timings, model_states)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (config_hash, session_id, question, query, model, think, answer, thinking,
+             Jsonb(hits), Jsonb(timings), Jsonb(model_states)),
+        )
+
     # --- benchmark reports -----------------------------------------------------------------------
 
     def create_report(

@@ -117,14 +117,67 @@ class MetricsStore:
         hits: list[dict],
         timings: dict,
         model_states: list[dict],
+        *,
+        events: list[dict] | None = None,
+        abstained: bool = False,
+        cited: list[int] | None = None,
+        total_ms: float | None = None,
+        settings: dict | None = None,
+        error: str | None = None,
     ) -> None:
-        self._execute(
-            """INSERT INTO chat_turns (config_hash, session_id, question, query, model, think, answer,
-                                       thinking, hits, timings, model_states)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (config_hash, session_id, question, query, model, think, answer, thinking,
-             Jsonb(hits), Jsonb(timings), Jsonb(model_states)),
-        )
+        """Save one turn. Its chat is made with its first turn (titled by the question) and its
+        `updated_at` moves with every turn; both happen in one transaction."""
+        with psycopg.connect(self.database_url) as conn:
+            conn.execute(
+                """INSERT INTO chat_sessions (session_id, config_hash, title) VALUES (%s, %s, %s)
+                   ON CONFLICT (session_id) DO UPDATE SET updated_at = now()""",
+                (session_id, config_hash, question[:80]),
+            )
+            conn.execute(
+                """INSERT INTO chat_turns (config_hash, session_id, question, query, model, think, answer,
+                                           thinking, hits, timings, model_states, events, abstained,
+                                           cited, total_ms, settings, error)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (config_hash, session_id, question, query, model, think, answer, thinking,
+                 Jsonb(hits), Jsonb(timings), Jsonb(model_states),
+                 Jsonb(events) if events is not None else None, abstained,
+                 Jsonb(cited) if cited is not None else None, total_ms,
+                 Jsonb(settings) if settings is not None else None, error),
+            )
+
+    def get_chat_session(self, session_id: str) -> dict | None:
+        with psycopg.connect(self.database_url) as conn:
+            row = conn.execute(
+                "SELECT config_hash, title FROM chat_sessions WHERE session_id = %s", (session_id,)
+            ).fetchone()
+        return {"config_hash": row[0], "title": row[1]} if row else None
+
+    def list_chat_sessions(self, config_hash: str, limit: int = 30) -> list[dict]:
+        """An experiment's chats, most recently used first, each with how many turns it has."""
+        with psycopg.connect(self.database_url) as conn:
+            rows = conn.execute(
+                """SELECT s.session_id, s.title, s.updated_at,
+                          (SELECT count(*) FROM chat_turns t WHERE t.session_id = s.session_id)
+                   FROM chat_sessions s WHERE s.config_hash = %s
+                   ORDER BY s.updated_at DESC LIMIT %s""",
+                (config_hash, limit),
+            ).fetchall()
+        return [{"session_id": r[0], "title": r[1], "updated_at": r[2], "turns": r[3]} for r in rows]
+
+    def get_chat_turns(self, session_id: str) -> list[dict]:
+        """A chat's turns, oldest first."""
+        keys = ["question", "query", "model", "think", "answer", "thinking", "hits", "timings",
+                "model_states", "events", "abstained", "cited", "total_ms", "settings", "error"]
+        with psycopg.connect(self.database_url) as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(keys)} FROM chat_turns WHERE session_id = %s ORDER BY created_at, id",
+                (session_id,),
+            ).fetchall()
+        return [dict(zip(keys, r)) for r in rows]
+
+    def delete_chat_session(self, session_id: str) -> None:
+        """Delete a chat; its turns go with it."""
+        self._execute("DELETE FROM chat_sessions WHERE session_id = %s", (session_id,))
 
     # --- benchmark reports -----------------------------------------------------------------------
 

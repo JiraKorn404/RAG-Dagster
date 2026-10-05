@@ -12,7 +12,7 @@ way to use the graph: it yields the events and saves the turn."""
 import functools
 import time
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import TypedDict
 
 from langgraph.config import get_stream_writer
@@ -29,7 +29,9 @@ from rag_lab.agent.events import (
     Rewrote,
     StepFinished,
     StepStarted,
+    Thinking,
     citations,
+    to_dict,
 )
 from rag_lab.agent.model import call_model, chat_model
 from rag_lab.agent.prompts import (
@@ -234,24 +236,69 @@ def run(
     session_id: str | None = None,
 ) -> Iterator[Event]:
     """Answer one question, yielding the events as they happen and `Done` last. With `metrics` and a
-    `session_id` the turn is saved to `chat_turns` and the retrieval to the search log. `cfg` is the
-    one the graph was built with (it records the model and the top k)."""
+    `session_id` the turn is saved to `chat_turns` (a failed turn too, with its error, before the error
+    is raised again) and the retrieval to the search log. A save that fails does not hide the answer:
+    `Done.saved` is false and `Done.save_error` says why. `cfg` is the one the graph was built with
+    (it records the model, the settings and the top k)."""
     cfg = cfg or AgentConfig()
     start = time.perf_counter()
     timings: dict[str, float] = {}
     states: list[ModelState] = []
+    stored: list[Event] = []  # what a saved turn replays from: every event but the token-by-token ones
+    searched, found, step_now = question, [], "starting"  # the last query, the last hits, the running step
     final: AgentState = {}
-    for mode, payload in graph.stream(
-        {"question": question, "history": history or []}, stream_mode=["custom", "values"]
-    ):
-        if mode == "values":
-            final = payload
-            continue
-        if isinstance(payload, StepFinished):
-            timings[payload.node] = timings.get(payload.node, 0.0) + payload.ms  # a retry repeats steps
-        elif isinstance(payload, ModelState):
-            states.append(payload)
-        yield payload
+
+    def save(answer: str, thinking: str, **extra) -> str | None:
+        """Save the turn. Returns why that failed, or None."""
+        if not (metrics and session_id):
+            return None
+        try:
+            metrics.add_chat_turn(
+                experiment.config_hash(),
+                session_id,
+                question,
+                searched,
+                cfg.model,
+                cfg.think,
+                answer,
+                thinking,
+                [asdict(h) for h in found],
+                timings,
+                [asdict(s) for s in states],
+                events=[to_dict(e) for e in stored],
+                total_ms=(time.perf_counter() - start) * 1000,
+                settings=cfg.model_dump(mode="json"),
+                **extra,
+            )
+        except Exception as e:  # noqa: BLE001  (a failed save is reported, never hides the answer)
+            return str(e)
+        return None
+
+    try:
+        for mode, payload in graph.stream(
+            {"question": question, "history": history or []}, stream_mode=["custom", "values"]
+        ):
+            if mode == "values":
+                final = payload
+                continue
+            if isinstance(payload, StepStarted):
+                step_now = payload.node
+            elif isinstance(payload, StepFinished):
+                timings[payload.node] = timings.get(payload.node, 0.0) + payload.ms  # a retry repeats steps
+            elif isinstance(payload, ModelState):
+                states.append(payload)
+            elif isinstance(payload, Query):
+                searched = payload.text
+            elif isinstance(payload, Rewrote):
+                searched = payload.query
+            elif isinstance(payload, Retrieved):
+                found = payload.hits
+            if not isinstance(payload, (Thinking, AnswerToken)):
+                stored.append(payload)
+            yield payload
+    except Exception as e:
+        save("", "", error=f"{step_now} failed: {e}")  # the original error is the one to raise
+        raise
 
     hits = final["retrieval"].hits
     cited, unknown = citations(final["answer"], len(hits))
@@ -264,29 +311,21 @@ def run(
         total_ms=(time.perf_counter() - start) * 1000,
         abstained=final.get("abstained", False),
     )
+    stored.append(done)
+    failure = None
     if metrics and session_id:
-        config_hash = experiment.config_hash()
         result = final["retrieval"]
-        metrics.add_search_log(
-            config_hash,
-            final["query"],
-            cfg.top_k,
-            result.embed_ms,
-            result.search_ms,
-            result.total_ms,
-            hits[0].similarity if hits else None,
-        )
-        metrics.add_chat_turn(
-            config_hash,
-            session_id,
-            question,
-            final["query"],
-            cfg.model,
-            cfg.think,
-            done.answer,
-            done.thinking,
-            [asdict(h) for h in hits],
-            timings,
-            [asdict(s) for s in states],
-        )
-    yield done
+        try:
+            metrics.add_search_log(
+                experiment.config_hash(),
+                final["query"],
+                cfg.top_k,
+                result.embed_ms,
+                result.search_ms,
+                result.total_ms,
+                hits[0].similarity if hits else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            failure = str(e)
+        failure = save(done.answer, done.thinking, abstained=done.abstained, cited=cited) or failure
+    yield replace(done, saved=False, save_error=failure) if failure else done

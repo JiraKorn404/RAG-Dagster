@@ -104,6 +104,8 @@ class Printer:
             print(f"; no such passage: {event.unknown_citations}" if event.unknown_citations else "")
             steps = ", ".join(f"{node} {ms:.0f}" for node, ms in event.timings.items())
             print(f"total {event.total_ms:.0f} ms ({steps})")
+            if not event.saved:
+                print(f"WARNING: this turn was not saved: {event.save_error}")
 
 
 def main() -> None:

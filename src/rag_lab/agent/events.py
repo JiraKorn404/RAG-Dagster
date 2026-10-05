@@ -1,7 +1,7 @@
 """What the agent reports while it works. A page or a CLI draws these without knowing the graph."""
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from rag_lab.search import Hit
 
@@ -82,11 +82,35 @@ class Done:
     timings: dict[str, float] = field(default_factory=dict)  # ms per step, summed over retries
     total_ms: float = 0.0
     abstained: bool = False  # the chunks did not answer it, so the answer is the fixed "not found" message
+    saved: bool = True  # false when saving the turn failed; the answer is still good
+    save_error: str | None = None
 
 
 Event = (
     StepStarted | StepFinished | Query | Graded | Rewrote | Retrieved | Thinking | AnswerToken | ModelState | Done
 )
+
+
+_TYPES = {
+    cls.__name__: cls
+    for cls in (
+        StepStarted, StepFinished, Query, Graded, Rewrote, Retrieved, Thinking, AnswerToken, ModelState, Done
+    )
+}
+
+
+def to_dict(event: Event) -> dict:
+    """The event as plain data (JSON-able), tagged with its class."""
+    return {"type": type(event).__name__, **asdict(event)}
+
+
+def from_dict(data: dict) -> Event:
+    """The event `to_dict` made, read back."""
+    fields = dict(data)
+    cls = _TYPES[fields.pop("type")]
+    if cls is Retrieved:
+        fields["hits"] = [Hit(**hit) for hit in fields["hits"]]
+    return cls(**fields)
 
 
 def citations(answer: str, passages: int) -> tuple[list[int], list[int]]:

@@ -1,6 +1,6 @@
 # Plan
 
-Phase 14 and the RAG chatbot (Phases 15 to 18) are planned (below). Phases 0 to 13 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that compares embedding models, chunking strategies and search strategies (dense, hybrid, reranked) and produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
+Phase 14 and the RAG chatbot (Phases 15 to 18) are built and wait for a look at the Chatbot page in a browser before they move to `COMPLETED_PLAN.md`. Chat history and chat metrics (Phases 19 and 20) are planned (below). Phases 0 to 13 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that compares embedding models, chunking strategies and search strategies (dense, hybrid, reranked) and produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
 
 A new phase is written here as `## Phase 14 — ...`: a goal, a table of decisions, numbered steps with checkboxes, and a "Done when" line that is checked once on the real stack. When it is done, its section moves to `COMPLETED_PLAN.md`.
 
@@ -206,6 +206,149 @@ So 0.5 and 0.1 leave a band of 0.1 to 0.5 that held three answerable questions, 
 - Chat history is kept in the browser session only; no checkpointer, no chat history page.
 - The page works on one experiment at a time.
 
+## Chat history and chat metrics (Phases 19 and 20)
+
+**Goal:** the Chatbot page keeps its conversations: a refresh does not lose the chat, and an earlier chat can be reopened with everything the page showed for it (the steps, the thinking, the chunks). And what the agent did and how long it took is in the database in full, including retries and failures.
+
+### What is stored today
+
+Checked in the live `rag_metrics` database (18 turns in 13 sessions, most of them test runs).
+
+| Stored | Where |
+|---|---|
+| The question, the last query searched, the model, whether it thought, the answer, the thinking text | `chat_turns` |
+| The final search's hits with their scores (`hits`) | `chat_turns` |
+| Milliseconds per step (`timings`: condense, retrieve, grade, rewrite, generate; a retry adds up) | `chat_turns` |
+| One record per model call (`model_states`): prompt and output tokens, tokens per second, whether the model was already loaded, `num_ctx`, `context_full` | `chat_turns` |
+| Embed, search and total milliseconds of each search, top k, the top score | `search_log` (`total_ms` includes the rerank; the rerank alone is not stored) |
+
+| Not stored | Why it matters |
+|---|---|
+| The retries: the queries tried, each grade verdict and score, each attempt's hits | The page shows them live, but only the last query is kept, so a past answer cannot be shown as it was. |
+| Whether the turn abstained, how many tokens the answer cites, the turn's total time | Cannot be counted or averaged without parsing text. |
+| The settings of the turn: reranker, candidates, top k, thresholds, `num_ctx` | A slow turn cannot be compared with another without knowing what was different. |
+| The rerank time on its own (it is only in the live event) | The biggest cost in a turn (2 to 18 s) cannot be queried. |
+| Failed turns | Nothing is written when a step fails, so errors are invisible. |
+
+Session history: none. The page keeps its messages in `st.session_state`, so a refresh or a new tab starts empty. `chat_turns` already has the content of each turn and a `session_id`, but there is no table for the chat itself and nothing reads the turns back.
+
+### Architecture
+
+The page already builds what it shows from the stream of events (Phase 16). So the plan stores the events of a turn, and reopening a chat replays them through the same code that draws a live answer. There is one way to build a turn's display, not a live one and a saved one that can drift apart.
+
+```
+live:    agent.run() --events--> page.apply(event) --> trace --> drawn
+saved:   the same events (without the token-by-token ones) --> chat_turns.events (jsonb)
+reopen:  chat_turns.events --> page.apply(event) --> trace --> drawn
+```
+
+A chat is a row in a new `chat_sessions` table (its id, its experiment, its title, when it was made and last used), and its turns are the `chat_turns` rows that point at it. The current chat's id lives in the page's URL (`?chat=<id>`), so a refresh finds it again.
+
+```
+experiments --< chat_sessions --< chat_turns        (a delete goes down the arrows)
+```
+
+### Phase 19 — Store a whole turn
+
+**Goal:** a turn is saved whole, with its metrics, whether it succeeded, abstained or failed.
+
+| Decision | Choice |
+|---|---|
+| Sessions table | Migration `0008_chat_sessions.sql` creates `chat_sessions`: `session_id text primary key`, `config_hash text not null references experiments on delete cascade` (the experiment the chat belongs to), `title text not null` (the first question, cut to 80 characters), `created_at` and `updated_at timestamptz not null default now()`. The number of turns is counted, not stored. Nothing else is kept on it: the settings of a turn belong to the turn, and there is no user column because there is no login. |
+| Turns table | The same migration adds to `chat_turns`: `events jsonb` (the turn's events in order), `abstained boolean not null default false`, `cited jsonb`, `total_ms double precision`, `settings jsonb` (the `AgentConfig` the turn ran with, including the search method, reranker and candidates) and `error text`; and makes `session_id` a foreign key to `chat_sessions` with `on delete cascade`, so deleting a chat is one delete. Old rows keep nulls in the new columns and are read as they are. |
+| Backfill | The migration first makes a `chat_sessions` row for every `session_id` already in `chat_turns` (experiment and title from its first turn, `created_at` and `updated_at` from its first and last turns), so the foreign key can be added. |
+| When a session is made | With its first turn, not when the page opens, so an empty chat leaves nothing behind. `add_chat_turn` inserts the session if it is new and sets its `updated_at`, in the same transaction as the turn. A failed first turn also makes the session. |
+| What goes in `events` | Everything except `AnswerToken` and `Thinking`, which are many tiny pieces: `Done` already has the whole answer and the whole thinking. So the stored events are `StepStarted`, `StepFinished`, `Query`, `Rewrote`, `Retrieved` (with the hits, the embed, search and rerank times), `Graded`, `ModelState` and `Done`. |
+| Existing columns | Kept and still filled (`question`, `answer`, `hits`, `timings`, `model_states`, ...), because they are what a SQL query reads. `events` is for replay, the columns are for counting. `query` stays the last query searched. |
+| Serialising | `to_dict(event)` and `from_dict(data)` in `agent/events.py`, tagged by class name; a `Retrieved` rebuilds its `Hit` objects. No library. |
+| Failures | `run()` saves a row with `error` set (the step that failed and the message, the events up to that point, `answer` empty) and then raises as before. |
+| A failed save | Does not hide the answer: `run()` still ends with `Done`, which gets `saved: bool` and `save_error`, and the page says under the answer that the turn was not saved. |
+| Search log | Unchanged. The rerank time is in `events`, and `total_ms - embed_ms - search_ms` in `search_log` is the rerank time for older rows. |
+| Tests | None. Checked once by a real round trip. |
+
+Steps:
+
+- [x] 1. Migration `0008_chat_sessions.sql` (the table, the backfill, the new `chat_turns` columns and the foreign key); `MetricsStore.add_chat_turn` takes the new fields and makes or touches the session in one transaction.
+- [x] 2. `to_dict` and `from_dict` in `agent/events.py`; `Done` gets `saved` and `save_error`.
+- [x] 3. `run()` collects the storable events, saves on success, saves an error row on failure, and reports a failed save instead of raising it.
+- [x] 4. `CLAUDE.md`: what `chat_turns` holds now, and the replay design.
+
+**Done when:** on the real stack, the migration leaves one `chat_sessions` row for each of the existing sessions (13 now); one answered turn, one abstained turn and one failed turn (a model name Ollama does not have) each leave a row, and a new chat makes exactly one session row whose `updated_at` moves with each turn; `events` read back and passed through `from_dict` equals the events that were streamed; and one SQL query over `chat_turns` gives the average total time, the average rerank time and the abstain rate by settings. Checked once.
+
+Built differently from the draft:
+
+- The page already tells you when a turn was not saved (two lines in `ui/chat.py`); the draft left that to Phase 20.
+- `Done.saved` is true unless a save was tried and failed, so it is also true when no `metrics` was given.
+- A failed turn is saved on a best-effort basis: if that save fails too, the original error is the one raised.
+- The search log is written before the turn; if either write fails, `Done.save_error` carries the reason.
+
+**Result (checked on the real stack):**
+
+- The migration made 13 `chat_sessions` rows from the 18 existing turns; the two-turn session kept its first and last timestamps as `created_at` and `updated_at`. The 18 old turns have null `events`.
+- Three new turns each left a row: an answered one (`cited [1]`, 13 events, 32 s), an abstained one (`abstained` true, 22 events, 34 s) and one with a model name Ollama does not have (`generate failed: model 'not-a-real-model:1b' not found`, empty answer, 10 events up to the failure). Each new chat made exactly one session row.
+- A two-turn chat: the session's `updated_at` moved with the second turn, and the events read back from the database and passed through `from_dict` equal the streamed events for both turns (13 and 14 events).
+- A turn run against an unreachable database still returned its answer, with `saved` false and the connection error in `save_error`.
+- One query over `chat_turns` now gives the numbers: by reranker and thinking setting, the average total time, the average rerank time (summed from the `Retrieved` events) and the abstain rate.
+
+What the first numbers say (from four turns, so only a hint): the rerank pass is 16 to 25 s of a 33 to 38 s turn, which is more than half of it. That is the 4B reranker scoring 20 candidates one request at a time on the Mac, possibly with model swapping, and is now measurable per turn. Fewer candidates would be the first thing to try; not done here.
+
+The table now also holds the test turns of this phase and the earlier ones; Phase 20's delete button is for those.
+
+### Phase 20 — Chat history on the Chatbot page
+
+**Goal:** the page keeps its chats and shows a past chat exactly as it was answered.
+
+| Decision | Choice |
+|---|---|
+| Identity | The chat id is `st.query_params["chat"]`. With no id a new one is made and put there, so a refresh, or a bookmarked link, opens the same chat. *New chat* makes a new id. |
+| One display path | The page's building of a turn's display moves into `apply(trace, event)`, used by the live loop and by replay. Reopening a chat replays each turn's `events` through it. A turn saved before Phase 19 (no `events`) is shown from its columns: the answer, the thinking, the hits, the timings and the model states, with the search list shortened to the one query. |
+| Past chats | A sidebar list of the selected experiment's `chat_sessions`, most recently used first: the title, the number of turns and when it was last used. Choosing one opens it. |
+| Experiment | A chat belongs to the experiment it was started in. The list shows the selected experiment's chats; changing the experiment opens a new chat, as now. |
+| Memory of the chat | Reopening a chat also rebuilds the agent's `history` from its answered turns (failed turns left out), so a follow-up question works where the chat left off. |
+| Failed turns | Shown in the chat with the error, as live. |
+| Delete | A *Delete this chat* button with a confirmation deletes the `chat_sessions` row; its turns go with it. Nothing else is deleted. |
+| Settings | The sidebar settings are not restored from an old chat; each turn's saved settings are shown in its "How this was answered" expander, so you can see what it ran with. |
+| Test turns | The table now holds test turns from the CLI and the page tests. They show as chats too; delete them with the button. |
+| Who sees what | No login for now (decided): anyone who can open the page sees every chat. Adding users later would mean a user column on `chat_sessions` and a filter in the list; nothing in this design stands in its way. |
+| Tests | None. |
+
+Steps:
+
+- [x] 1. `MetricsStore.list_chat_sessions(config_hash)` (with the turn count), `get_chat_turns(session_id)` and `delete_chat_session(session_id)`.
+- [x] 2. `ui/chat.py`: move the display building into `apply(trace, event)`; use it for live answers and for replay; read `Done.saved`.
+- [x] 3. `ui/chat.py`: the chat id in `st.query_params`, loading a chat's turns and `history` when its id is not the one in `session_state`.
+- [x] 4. The sidebar *Past chats* list, *New chat* and *Delete this chat*.
+- [x] 5. `CLAUDE.md`: the chat id in the URL, replay, delete.
+- [x] 6. `docker compose restart ui` if a module other than a page script changed.
+
+**Done when:** in the browser, two questions are asked, the page is refreshed and the same two turns appear with their expanders; *New chat* starts an empty chat and the first one is in *Past chats*; opening it and asking a follow-up works; a chat saved before Phase 19 opens with its answers; deleting a chat removes it from the list. Look at it by eye (the Phase 17 and 18 browser check is still open) and drive it once with the app tester.
+
+Built differently from the draft:
+
+- The agent's `history` is no longer kept in `st.session_state`; it is derived from the displayed messages (`history_of`), so a chat reopened from the database has the right history by construction.
+- After each turn the page reruns, so the finished turn is drawn from what was kept (the same path as a reopened chat) and the *Past chats* list is current. The live status panel therefore disappears when the answer is done; its content is in "How this was answered".
+- The experiment selector is keyed and set from the chat's own experiment, and changing it is a callback that starts a new chat. Without that, a refresh would show the first experiment whatever the chat belonged to.
+- A chat whose experiment is no longer available gets a warning and a new chat.
+- The delete is a popover with a confirmation button; `Past chats` shows up to 30 chats, titled by the first question, with the turn count in the label and the last use (UTC) in the tooltip.
+- Added `MetricsStore.get_chat_session` (to find a chat's experiment from its id).
+
+**Result (driven with Streamlit's app tester inside the `ui` container, against the real stack):**
+
+- Two questions in a new chat; a fresh page session on the same `?chat=` URL (a refresh) showed the same 4 messages with both expanders and the chat's experiment selected.
+- *New chat* gave an empty chat with a new id and no session row until its first turn; the finished chat was in *Past chats* and opening it from there showed its turns again.
+- A follow-up asked in a chat that had been reloaded from the database was rewritten into a standalone query using the earlier turns ("and how should the pilot handle the landing in that case?" became a question about landing after an open-door accident), so the rebuilt history works.
+- A chat saved before the events were kept (pre-`0008`) opened with its answers.
+- *Delete this chat* removed the chat's session row and, by cascade, its turns, and moved to a new empty chat. (My test clicked it on a legacy test chat by mistake; the effect is the same, and that test chat is gone.)
+- **Not seen by eye:** the page in a browser. The Chrome extension was not connected when I tried, and the Phase 17 and 18 look is also still open. Look at the sidebar (the list of past chats is long because the table holds this project's test turns), the popover and the chat after a refresh before moving Phases 14 to 20 to `COMPLETED_PLAN.md`.
+- The `ui` container was restarted (a module under `src/`, `metrics/store.py`, changed).
+
+### Open choices (defaults used above unless you say otherwise)
+
+- Events are stored as one `jsonb` column next to the old columns, not in a table of their own: one row is one turn and replay reads one value.
+- A `chat_sessions` table (decided), kept to what a list and a delete need; the title is the first question, cut to 80 characters. Renaming or pinning a chat is under Ideas and would only add a column.
+- The URL carries the chat id, not a login or a cookie. No login for now (decided).
+- Performance numbers are read with SQL for now. A page of charts over `chat_turns` (time per step, tokens per second, abstain rate by settings) is under Ideas.
+
 ## Working approach
 
 Keep the project minimal. Testing is deliberately light:
@@ -225,6 +368,7 @@ Keep the project minimal. Testing is deliberately light:
 
 Not planned and not in any phase. Each is built only when you ask for it.
 
+- Chatbot: a "Performance" page or tab over `chat_turns` (time per step, tokens per second, abstain rate and score by settings, slowest turns), and renaming or pinning a chat.
 - Chatbot: a tool-calling variant where the model chooses between searching, searching one document (`source_file` filter) and answering directly; a groundedness check that verifies each cited claim against its chunk; a Postgres checkpointer and a page of past chats; restricting a chat to chosen documents.
 - A "Process with Dagster" option on the Upload page: copy the PDF to `data/raw/`, register its partition, launch `ingest_job` with the page's settings (and `tag`) as run config, and link to the run. The run would then show in the Dagster UI, at the cost of the page's chunk preview.
 - Benchmark: several documents in one report; test queries generated by a local LLM from the document's own text; a Unicode font in the PDF so names with other characters are not replaced with `?`.

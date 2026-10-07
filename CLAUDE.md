@@ -115,7 +115,7 @@ src/rag_lab/
   parsing/                   # Docling converter factory and options; parse_pdf reads through DoclingReader
   chunking/                  # segment.py (blocks, reference text), sectioned.py, spans.py, one module per strategy, base.py registry, tokens.py, llamaindex.py (the llamaindex engine)
   embedding/                 # ollama.py (embedder), vectors.py, cache.py (on-disk embedding cache), llamaindex.py (BaseEmbedding adapter), sparse.py (BM25 sparse vectors)
-  agent/                     # the chatbot agent. Shared: events.py, model.py (chat model, ModelState), run.py (step(), run(), Flow, Summary), printer.py (CLI output), __main__.py (python -m rag_lab.agent <flow>). documents/: the flow for documents (graph.py with DocumentsFlow, prompts.py, cli.py). sql/: the flow for a database schema (graph.py with SqlFlow, prompts.py, cli.py). A flow is a folder
+  agent/                     # the chatbot agent. Shared: events.py, model.py (chat model, ModelState, the condense step), run.py (step(), run(), Flow, Summary), printer.py (CLI output and the chat loop), __main__.py (python -m rag_lab.agent <flow>). documents/: the flow for documents (graph.py with DocumentsFlow, prompts.py, cli.py). sql/: the flow for a database schema (graph.py with SqlFlow, prompts.py, cli.py). A flow is a folder
   reranking/                 # ollama.py (Qwen3-Reranker through /api/generate)
   storage/                   # Qdrant collection setup, delete and query (writes go through LlamaIndex's store)
   search/                    # engine.py (search(), with the search method), __main__.py (CLI, dense), quick.py (ask() for notebooks, dense)

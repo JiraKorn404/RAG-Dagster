@@ -1,4 +1,9 @@
-"""Prints a turn's events as they arrive, for the command-line interfaces of every flow."""
+"""What the command-line interfaces of every flow share: the printing of a turn's events as they arrive,
+and the chat loop."""
+
+import os
+import sys
+import uuid
 
 from rag_lab.agent.events import (
     AnswerToken,
@@ -19,8 +24,17 @@ from rag_lab.agent.events import (
     StepStarted,
     Thinking,
 )
+from rag_lab.agent.run import Flow, run
+from rag_lab.metrics.store import MetricsStore
 
 DIM, RESET = "\033[2m", "\033[0m"
+
+
+def env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"{name} is not set")
+    return value
 
 
 class Printer:
@@ -107,3 +121,30 @@ class Printer:
             print(f"total {event.total_ms:.0f} ms ({steps})")
             if not event.saved:
                 print(f"WARNING: this turn was not saved: {event.save_error}")
+
+
+def chat_loop(graph, flow: Flow, metrics: MetricsStore, question: str | None, remember=None) -> None:
+    """Answer `question` and stop, or, without one, read questions from the prompt (an empty line ends)
+    and keep the conversation. `remember(answer, events)` gives what an answer leaves in the history when
+    that is more than the answer."""
+    session_id = uuid.uuid4().hex[:12]
+    show = Printer()
+    history: list[tuple[str, str]] = []
+    once = bool(question)
+    while True:
+        if question is None:
+            question = input("> ").strip()
+            if not question:
+                return
+        events = []
+        try:
+            for event in run(graph, flow, question, history, metrics=metrics, session_id=session_id):
+                show(event)
+                events.append(event)
+        except ValueError as e:  # for example an experiment without the BM25 vector, or a schema deleted meanwhile
+            sys.exit(str(e))
+        if once:
+            return
+        answer = events[-1].answer  # the last event is Done
+        history += [("User", question), ("Assistant", remember(answer, events) if remember else answer)]
+        question = None

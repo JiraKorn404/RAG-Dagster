@@ -42,7 +42,7 @@ def condense_prompt(question: str, history: list[tuple[str, str]]) -> str:
     return f"Conversation so far:\n{turns}\n\nLatest question: {question}\n\nStandalone question:"
 
 
-def examples_text(examples: list) -> str:
+def examples_text(examples: list | None) -> str:
     """Good answers to similar questions, as a section of the prompt (empty when there are none)."""
     if not examples:
         return ""
@@ -54,12 +54,12 @@ def examples_text(examples: list) -> str:
 
 
 def write_prompt(schema_text: str, question: str, examples: list | None = None) -> str:
-    return f"{schema_text}{examples_text(examples or [])}\n\nQuestion: {question}"
+    return f"{schema_text}{examples_text(examples)}\n\nQuestion: {question}"
 
 
 def repair_prompt(schema_text: str, question: str, sql: str, error: str, examples: list | None = None) -> str:
     return (
-        f"{schema_text}{examples_text(examples or [])}\n\nQuestion: {question}\n\nYou wrote this query:\n```sql\n{sql}\n```\n"
+        f"{write_prompt(schema_text, question, examples)}\n\nYou wrote this query:\n```sql\n{sql}\n```\n"
         f"It could not be used: {error}\n\nWrite a corrected query. If the tables cannot answer the question, "
         "reply with exactly CANNOT."
     )

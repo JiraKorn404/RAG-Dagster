@@ -16,7 +16,7 @@ from rag_lab.storage.qdrant import QdrantStore
 
 CFG = ImportConfig()
 DELIMITER_CHOICES = {"detect": None, "comma ,": ",", "semicolon ;": ";", "tab": "\t", "bar |": "|"}
-PROBLEMS = (importer.CsvError, ValueError, RuntimeError, psycopg.Error)  # shown to the user, not raised
+PROBLEMS = (ValueError, RuntimeError, psycopg.Error)  # shown to the user, not raised (a CsvError is a ValueError)
 
 
 @st.cache_resource
@@ -27,6 +27,12 @@ def store() -> MetricsStore:
 @st.cache_resource
 def example_services() -> tuple[OllamaEmbedder, QdrantStore]:
     return OllamaEmbedder(os.environ["OLLAMA_BASE_URL"]), QdrantStore(os.environ["QDRANT_URL"])
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def sample_of(file_id: str, delimiter: str | None, _data: bytes) -> importer.CsvSample:
+    """The sample of an uploaded file, read once for an upload and a delimiter, not on every rerun."""
+    return importer.parse_sample(_data, delimiter, CFG)
 
 
 def import_panel(file, schema: str, tables: dict[str, dict]) -> None:
@@ -41,7 +47,7 @@ def import_panel(file, schema: str, tables: dict[str, dict]) -> None:
         c1, c2 = st.columns([1, 2])
         choice = c1.selectbox("Delimiter", list(DELIMITER_CHOICES), key=f"delimiter-{key}")
         try:
-            sample = importer.parse_sample(data, DELIMITER_CHOICES[choice], CFG)
+            sample = sample_of(file.file_id, DELIMITER_CHOICES[choice], data)
         except importer.CsvError as e:
             st.error(str(e))
             return

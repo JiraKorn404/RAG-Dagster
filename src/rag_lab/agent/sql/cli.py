@@ -8,13 +8,10 @@ Needs OLLAMA_BASE_URL, QDRANT_URL, METRICS_DATABASE_URL and SQL_READER_URL in th
 inside the dagster-code container). Good answers saved for the schema are shown to the model when a similar
 question is asked; `--no-examples` leaves them out."""
 
-import os
 import sys
-import uuid
 
-from rag_lab.agent import run
-from rag_lab.agent.events import Done, SqlChecked
-from rag_lab.agent.printer import Printer
+from rag_lab.agent.events import Event, SqlChecked
+from rag_lab.agent.printer import chat_loop, env
 from rag_lab.agent.sql import SqlFlow, build_graph, remembered
 from rag_lab.config import SqlAgentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
@@ -23,11 +20,9 @@ from rag_lab.metrics.store import MetricsStore
 from rag_lab.storage.qdrant import QdrantStore
 
 
-def _env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        sys.exit(f"{name} is not set")
-    return value
+def _remember(answer: str, events: list[Event]) -> str:
+    sql = next((e.sql for e in reversed(events) if isinstance(e, SqlChecked) and e.ok), "")
+    return remembered(answer, sql)
 
 
 def add_parser(subparsers) -> None:
@@ -47,35 +42,11 @@ def main(args) -> None:
         **({"use_examples": False} if args.no_examples else {}),
     }
     cfg = SqlAgentConfig(**overrides)
-    base_url = _env("OLLAMA_BASE_URL")
-    database_url = _env("METRICS_DATABASE_URL")
+    base_url = env("OLLAMA_BASE_URL")
+    database_url = env("METRICS_DATABASE_URL")
     apply_migrations(database_url)
     metrics = MetricsStore(database_url)
     if not metrics.get_db_schema(args.schema):
         sys.exit(f"There is no schema '{args.schema}'. Import a CSV file into one on the Database page.")
-    graph = build_graph(metrics, args.schema, base_url, cfg, OllamaEmbedder(base_url), QdrantStore(_env("QDRANT_URL")))
-    flow = SqlFlow(args.schema, cfg)
-
-    session_id = uuid.uuid4().hex[:12]
-    show = Printer()
-    history: list[tuple[str, str]] = []
-    question = args.question
-    while True:
-        if question is None:
-            question = input("> ").strip()
-            if not question:
-                return
-        answer, sql = "", ""
-        try:
-            for event in run(graph, flow, question, history, metrics=metrics, session_id=session_id):
-                show(event)
-                if isinstance(event, SqlChecked) and event.ok:
-                    sql = event.sql
-                if isinstance(event, Done):
-                    answer = event.answer
-        except ValueError as e:  # for example a schema that was deleted meanwhile
-            sys.exit(str(e))
-        if args.question:
-            return
-        history += [("User", question), ("Assistant", remembered(answer, sql))]
-        question = None
+    graph = build_graph(metrics, args.schema, base_url, cfg, OllamaEmbedder(base_url), QdrantStore(env("QDRANT_URL")))
+    chat_loop(graph, SqlFlow(args.schema, cfg), metrics, args.question, _remember)

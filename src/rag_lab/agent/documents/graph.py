@@ -27,7 +27,7 @@ from rag_lab.agent.documents.prompts import (
     rewrite_prompt,
 )
 from rag_lab.agent.events import AnswerToken, Event, Graded, Query, Retrieved, Rewrote, citations
-from rag_lab.agent.model import call_model, chat_model
+from rag_lab.agent.model import call_model, chat_model, standalone_question
 from rag_lab.agent.run import Summary, step
 from rag_lab.config import AgentConfig, ExperimentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
@@ -65,20 +65,7 @@ def build_graph(
 
     @step
     def condense(state: AgentState) -> dict:
-        history = state.get("history", [])[-2 * cfg.history_turns :]
-        query = state["question"]
-        if history:
-            query, _ = call_model(
-                quick_llm,
-                base_url,
-                cfg,
-                "condense",
-                think=False,
-                stream=False,
-                messages=[("system", CONDENSE_SYSTEM), ("human", condense_prompt(query, history))],
-            )
-            query = query.strip() or state["question"]
-        get_stream_writer()(Query(query, rewritten=query != state["question"]))
+        query = standalone_question(quick_llm, base_url, cfg, state, CONDENSE_SYSTEM, condense_prompt)
         return {"standalone": query, "query": query, "tried": [], "rewrites": 0}
 
     @step

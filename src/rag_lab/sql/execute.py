@@ -68,13 +68,13 @@ def _session(schema: str, timeout_s: float):
         raise SqlError(_message(e, timeout_s)) from None
 
 
-def explain(schema: str, query: str, timeout_s: float = 10) -> None:
+def explain(schema: str, query: str, timeout_s: float) -> None:
     """Plan a checked query without running it. Raises `SqlError` for what the database would refuse."""
     with _session(schema, timeout_s) as conn:
         conn.execute("EXPLAIN " + query)
 
 
-def run(schema: str, query: str, row_limit: int, timeout_s: float = 10) -> QueryResult:
+def run(schema: str, query: str, row_limit: int, timeout_s: float) -> QueryResult:
     """Run a checked query. At most `row_limit + 1` rows are read, to tell whether the result was cut."""
     start = time.perf_counter()
     with _session(schema, timeout_s) as conn:

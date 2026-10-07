@@ -179,6 +179,13 @@ def attempt_lines(trace: dict) -> str:
     )
 
 
+def _database_error(attempt: dict) -> str:
+    """What the database said about an attempt; empty when it is the check's refusal, which is shown as that."""
+    checked = attempt["checked"]
+    refusal = checked is not None and not checked.ok and checked.reason == attempt["error"]
+    return "" if refusal else attempt["error"]
+
+
 def sql_attempt_lines(trace: dict) -> str:
     """The queries of a database turn so far, as markdown: what the model wrote, what the check said, what
     the database said. Used while the answer is being made."""
@@ -191,8 +198,8 @@ def sql_attempt_lines(trace: dict) -> str:
         if a["ran"] is not None:
             cut = " (cut at the row limit)" if a["ran"].truncated else ""
             parts.append(f"Ran in {a['ran'].ms:.0f} ms: {a['ran'].row_count} row(s){cut}")
-        if a["error"] and not (checked is not None and not checked.ok and checked.reason == a["error"]):
-            parts.append(f"The database said: {a['error']}")
+        if error := _database_error(a):
+            parts.append(f"The database said: {error}")
     return "\n\n".join(parts)
 
 
@@ -227,6 +234,13 @@ def _models(trace: dict) -> None:
         st.caption(settings_line(trace["settings"]))
 
 
+def _thinking(trace: dict) -> None:
+    if trace["thinking"]:
+        st.markdown(trace["thinking"])
+    else:
+        st.caption("The model did not think for this answer.")
+
+
 def show_trace(trace: dict) -> None:
     """Everything the agent did for one answer."""
     if trace["kind"] == "database":
@@ -252,10 +266,7 @@ def show_trace(trace: dict) -> None:
             if done and done.unknown_citations:
                 st.warning(f"The answer cites passage(s) {done.unknown_citations}, which do not exist.")
         with thinking:
-            if trace["thinking"]:
-                st.markdown(trace["thinking"])
-            else:
-                st.caption("The model did not think for this answer.")
+            _thinking(trace)
         with chunks:
             if not retrieved or not retrieved.hits:
                 st.caption("Nothing was retrieved.")
@@ -282,10 +293,7 @@ def show_sql_trace(trace: dict) -> None:
                 _timeline(done)
             _models(trace)
         with thinking:
-            if trace["thinking"]:
-                st.markdown(trace["thinking"])
-            else:
-                st.caption("The model did not think for this answer.")
+            _thinking(trace)
         with schema_tab:
             if not schema:
                 st.caption("The schema was not read.")
@@ -316,8 +324,8 @@ def show_sql_trace(trace: dict) -> None:
                         st.code(checked.sql, language="sql")
                 elif checked is not None:
                     st.error(f"Refused: {checked.reason}")
-                if a["error"] and not (checked is not None and not checked.ok and checked.reason == a["error"]):
-                    st.error(f"The database said: {a['error']}")
+                if error := _database_error(a):
+                    st.error(f"The database said: {error}")
                 ran = a["ran"]
                 if ran is not None:
                     shown = len(ran.rows)

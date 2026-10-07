@@ -29,6 +29,9 @@ class CsvError(ValueError):
     """A file that cannot be imported, with a message for the person who uploaded it."""
 
 
+NOT_UTF8 = "The file is not UTF-8. Save it as 'CSV UTF-8' and upload it again."
+
+
 # --- names ---------------------------------------------------------------------------------------
 
 
@@ -179,7 +182,7 @@ def _decode_sample(data: bytes, cfg: ImportConfig) -> tuple[str, bool]:
         if truncated and e.start >= len(head) - 4:  # a character cut in two by the end of the sample
             text = head[: e.start].decode("utf-8-sig")
         else:
-            raise CsvError("The file is not UTF-8. Save it as 'CSV UTF-8' and upload it again.") from None
+            raise CsvError(NOT_UTF8) from None
     if truncated and "\n" in text:
         text = text[: text.rindex("\n") + 1]  # the last line may be cut
     return text, truncated
@@ -214,7 +217,7 @@ def _profile(conn: psycopg.Connection, schema: str, table: str, columns: list[di
     """Fill in each column's profile from the loaded data: nulls, distinct values, example values for a text
     column with few distinct values, the range of numbers and dates. It is what lets a small model see that
     `status` holds `Shipped`, not `shipped`."""
-    source = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
+    source = sql.Identifier(schema, table)
     for column in columns:
         name, kind = sql.Identifier(column["name"]), column["type"]
         ranged = kind in ("bigint", "double precision", "date", "timestamp", "timestamptz")
@@ -267,7 +270,7 @@ def import_csv(
     if any(t not in TYPES for t in types):
         raise CsvError(f"A column type is not one of {', '.join(TYPES)}.")
 
-    target = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(table))
+    target = sql.Identifier(schema, table)
     old = metrics.get_db_table(schema, table)
     columns = [
         {"name": n, "type": t, "header": h, "description": h if h != n else ""}
@@ -305,7 +308,7 @@ def import_csv(
                 raise CsvError(f"The file has {rows:,} rows; the limit is {cfg.max_rows:,}.")
             _profile(conn, schema, table, columns, cfg)
     except UnicodeDecodeError:
-        raise CsvError("The file is not UTF-8. Save it as 'CSV UTF-8' and upload it again.") from None
+        raise CsvError(NOT_UTF8) from None
     except psycopg.Error as e:  # a bad row: say which one
         where = (e.diag.context or "").splitlines()[-1] if e.diag.context else ""
         raise CsvError(f"{(e.diag.message_primary or str(e)).strip()}. {where}".strip()) from None

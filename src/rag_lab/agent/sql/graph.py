@@ -10,7 +10,7 @@ database check it before it runs as the read-only role. It thinks while it write
 does not when it rewrites the question or words the answer. Every node reports what it does as events
 (agent/events.py); `agent.run()` is the way to use the graph, with a `SqlFlow`."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TypedDict
 
 from langgraph.config import get_stream_writer
@@ -21,14 +21,13 @@ from rag_lab.agent.events import (
     AnswerToken,
     Event,
     ExamplesFound,
-    Query,
     Repairing,
     SchemaShown,
     SqlChecked,
     SqlRan,
     SqlWritten,
 )
-from rag_lab.agent.model import call_model, chat_model
+from rag_lab.agent.model import call_model, chat_model, standalone_question
 from rag_lab.agent.run import Summary, step
 from rag_lab.agent.sql.prompts import (
     ANSWER_SYSTEM,
@@ -78,34 +77,36 @@ def build_graph(
     metrics: MetricsStore,
     schema_name: str,
     base_url: str,
-    cfg: SqlAgentConfig | None = None,
-    embedder: OllamaEmbedder | None = None,
-    store: QdrantStore | None = None,
+    cfg: SqlAgentConfig,
+    embedder: OllamaEmbedder,
+    store: QdrantStore,
 ):
-    """`embedder` and `store` are for the good answers: without them, or with `use_examples` off, none are looked for."""
-    cfg = cfg or SqlAgentConfig()
+    """`embedder` and `store` are for the good answers; with `use_examples` off none are looked for."""
     quick_llm = chat_model(base_url, cfg, think=False)  # condense and answer never think
     sql_llm = chat_model(base_url, cfg, think=cfg.think)
 
     def give_up_or_repair(state: SqlState) -> str:
         return "repair" if state["repairs"] < cfg.max_repairs else "abstain"
 
+    def write(node: str, prompt: str, attempt: int) -> tuple[str, str]:
+        """Ask for a query and report it. Returns (sql, thinking)."""
+        reply, thinking = call_model(
+            sql_llm,
+            base_url,
+            cfg,
+            node,
+            think=cfg.think,
+            stream=True,
+            tokens=False,  # the SQL is not the answer: it is reported as SqlWritten
+            messages=[("system", WRITE_SYSTEM), ("human", prompt)],
+        )
+        sql = extract_sql(reply)
+        get_stream_writer()(SqlWritten(sql, attempt=attempt))
+        return sql, thinking
+
     @step
     def condense(state: SqlState) -> dict:
-        history = state.get("history", [])[-2 * cfg.history_turns :]
-        question = state["question"]
-        if history:
-            question, _ = call_model(
-                quick_llm,
-                base_url,
-                cfg,
-                "condense",
-                think=False,
-                stream=False,
-                messages=[("system", CONDENSE_SYSTEM), ("human", condense_prompt(question, history))],
-            )
-            question = question.strip() or state["question"]
-        get_stream_writer()(Query(question, rewritten=question != state["question"]))
+        question = standalone_question(quick_llm, base_url, cfg, state, CONDENSE_SYSTEM, condense_prompt)
         return {"standalone": question, "repairs": 0, "error": "", "stop": ""}
 
     @step
@@ -123,26 +124,16 @@ def build_graph(
     @step
     def examples(state: SqlState) -> dict:
         """Good answers to questions like this one, when the schema has any: no call is made when it has none."""
-        if not (cfg.use_examples and embedder and store and good_answers.has_examples(store, schema_name)):
+        if not (cfg.use_examples and good_answers.has_examples(store, schema_name)):
             return {"examples": []}
         found = good_answers.retrieve(embedder, store, cfg, schema_name, state["standalone"])
-        get_stream_writer()(ExamplesFound([e.as_dict() for e in found]))
+        get_stream_writer()(ExamplesFound([asdict(e) for e in found]))
         return {"examples": found}
 
     @step
     def write_sql(state: SqlState) -> dict:
-        reply, thinking = call_model(
-            sql_llm,
-            base_url,
-            cfg,
-            "write_sql",
-            think=cfg.think,
-            stream=True,
-            tokens=False,  # the SQL is not the answer: it is reported as SqlWritten
-            messages=[("system", WRITE_SYSTEM), ("human", write_prompt(state["schema"].text, state["standalone"], state.get("examples")))],
-        )
-        sql = extract_sql(reply)
-        get_stream_writer()(SqlWritten(sql, attempt=1))
+        prompt = write_prompt(state["schema"].text, state["standalone"], state.get("examples"))
+        sql, thinking = write("write_sql", prompt, 1)
         return {"sql": sql, "thinking": thinking}
 
     @step
@@ -170,21 +161,8 @@ def build_graph(
     def repair(state: SqlState) -> dict:
         attempt = state["repairs"] + 1
         get_stream_writer()(Repairing(state["error"], attempt))
-        reply, thinking = call_model(
-            sql_llm,
-            base_url,
-            cfg,
-            "repair",
-            think=cfg.think,
-            stream=True,
-            tokens=False,
-            messages=[
-                ("system", WRITE_SYSTEM),
-                ("human", repair_prompt(state["schema"].text, state["standalone"], state["sql"], state["error"], state.get("examples"))),
-            ],
-        )
-        sql = extract_sql(reply)
-        get_stream_writer()(SqlWritten(sql, attempt=attempt + 1))
+        prompt = repair_prompt(state["schema"].text, state["standalone"], state["sql"], state["error"], state.get("examples"))
+        sql, thinking = write("repair", prompt, attempt + 1)
         earlier = state.get("thinking", "")
         return {"sql": sql, "repairs": attempt, "thinking": f"{earlier}\n\n{thinking}".strip() if thinking else earlier}
 
@@ -207,12 +185,12 @@ def build_graph(
     @step
     def abstain(state: SqlState) -> dict:
         if state.get("stop"):
-            reason, sql = state["stop"], ""
+            reason, sql, error = state["stop"], "", ""
         elif state.get("sql") == CANNOT:
-            reason, sql = "The tables do not seem to hold what this question asks for.", ""
+            reason, sql, error = "The tables do not seem to hold what this question asks for.", "", ""
         else:
-            reason, sql = f"No working query was found after {cfg.max_repairs} repair(s).", state.get("sql", "")
-        text = not_answered(reason, sql, "" if state.get("sql") == CANNOT else state.get("error", ""))
+            reason, sql, error = f"No working query was found after {cfg.max_repairs} repair(s).", state["sql"], state["error"]
+        text = not_answered(reason, sql, error)
         get_stream_writer()(AnswerToken(text))
         return {"answer": text, "abstained": True}
 
@@ -223,10 +201,10 @@ def build_graph(
     graph.add_edge("condense", "schema")
     graph.add_conditional_edges("schema", lambda s: "abstain" if s.get("stop") else "examples", ["abstain", "examples"])
     graph.add_edge("examples", "write_sql")
-    graph.add_conditional_edges("write_sql", lambda s: "abstain" if s["sql"] == CANNOT else "check", ["abstain", "check"])
+    for node in ("write_sql", "repair"):
+        graph.add_conditional_edges(node, lambda s: "abstain" if s["sql"] == CANNOT else "check", ["abstain", "check"])
     graph.add_conditional_edges("check", lambda s: give_up_or_repair(s) if s["error"] else "run_sql", ["repair", "abstain", "run_sql"])
     graph.add_conditional_edges("run_sql", lambda s: give_up_or_repair(s) if s["error"] else "answer", ["repair", "abstain", "answer"])
-    graph.add_conditional_edges("repair", lambda s: "abstain" if s["sql"] == CANNOT else "check", ["abstain", "check"])
     graph.add_edge("answer", END)
     graph.add_edge("abstain", END)
     return graph.compile()

@@ -161,21 +161,18 @@ class MetricsStore:
     def list_chat_sessions(self, limit: int = 30) -> list[dict]:
         """The chats of both kinds, most recently used first, each with its kind, what it searches (the
         experiment's name or the schema) and how many turns it has."""
+        keys = ["session_id", "title", "updated_at", "kind", "target", "turns"]
         with psycopg.connect(self.database_url) as conn:
             rows = conn.execute(
-                """SELECT s.session_id, s.title, s.updated_at, s.kind, s.config_hash, s.schema_name,
-                          (SELECT e.name FROM experiments e WHERE e.config_hash = s.config_hash LIMIT 1),
+                """SELECT s.session_id, s.title, s.updated_at, s.kind,
+                          CASE WHEN s.kind = 'documents'
+                               THEN (SELECT e.name FROM experiments e WHERE e.config_hash = s.config_hash LIMIT 1)
+                               ELSE s.schema_name END,
                           (SELECT count(*) FROM chat_turns t WHERE t.session_id = s.session_id)
                    FROM chat_sessions s ORDER BY s.updated_at DESC LIMIT %s""",
                 (limit,),
             ).fetchall()
-        return [
-            {
-                "session_id": r[0], "title": r[1], "updated_at": r[2], "kind": r[3], "config_hash": r[4],
-                "schema_name": r[5], "target": r[6] if r[3] == "documents" else r[5], "turns": r[7],
-            }
-            for r in rows
-        ]
+        return [dict(zip(keys, r)) for r in rows]
 
     def get_chat_turns(self, session_id: str) -> list[dict]:
         """A chat's turns, oldest first."""

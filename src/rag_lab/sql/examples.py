@@ -7,18 +7,9 @@ standalone question. A change goes to the table first and then to Qdrant, so a f
 is put right by `reindex`, which rebuilds the collection from the table."""
 
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
-from qdrant_client.models import (
-    Distance,
-    FieldCondition,
-    Filter,
-    MatchValue,
-    PayloadSchemaType,
-    PointIdsList,
-    PointStruct,
-    VectorParams,
-)
+from qdrant_client.models import Distance, PayloadSchemaType, PointIdsList, PointStruct, VectorParams
 
 from rag_lab.config import EmbedConfig, SqlAgentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
@@ -35,9 +26,6 @@ class Example:
     sql: str
     score: float = 0.0  # the similarity to the question asked, for a retrieved example
 
-    def as_dict(self) -> dict:
-        return asdict(self)
-
 
 def collection_name(schema: str) -> str:
     return SQL_EXAMPLES_PREFIX + schema
@@ -53,6 +41,11 @@ def embed_key(cfg: EmbedConfig) -> str:
     return f"{cfg.model}|{cfg.dimension or 'native'}"
 
 
+def _check_size(store: QdrantStore, schema: str, size: int) -> None:
+    if store.stats(collection_name(schema))["vector_dimension"] != size:
+        raise ValueError(f"The examples of '{schema}' were indexed with another embedding setup. Run `python -m rag_lab.sql examples --reindex`.")
+
+
 def _upsert(embedder: OllamaEmbedder, store: QdrantStore, cfg: SqlAgentConfig, schema: str, rows: list[dict]) -> None:
     """Embed the rows' standalone questions and write their points, creating the collection if needed."""
     if not rows:
@@ -62,8 +55,8 @@ def _upsert(embedder: OllamaEmbedder, store: QdrantStore, cfg: SqlAgentConfig, s
     if not client.collection_exists(name):
         client.create_collection(name, vectors_config=VectorParams(size=len(vectors[0]), distance=Distance.COSINE))
         client.create_payload_index(name, "embed_key", PayloadSchemaType.KEYWORD)
-    elif client.get_collection(name).config.params.vectors.size != len(vectors[0]):
-        raise ValueError(f"The examples of '{schema}' were indexed with another embedding setup. Run `python -m rag_lab.sql examples --reindex`.")
+    else:
+        _check_size(store, schema, len(vectors[0]))
     client.upsert(
         name,
         points=[
@@ -86,6 +79,13 @@ def _delete_point(store: QdrantStore, schema: str, example_id: int) -> None:
     name = collection_name(schema)
     if store.client.collection_exists(name):
         store.client.delete(name, points_selector=PointIdsList(points=[point_id(schema, example_id)]))
+
+
+def drop_index(store: QdrantStore, schema: str) -> None:
+    """Remove a schema's collection of examples, if it has one."""
+    name = collection_name(schema)
+    if store.client.collection_exists(name):
+        store.delete_collection(name)
 
 
 def save(
@@ -124,19 +124,14 @@ def has_examples(store: QdrantStore, schema: str) -> bool:
 def retrieve(embedder: OllamaEmbedder, store: QdrantStore, cfg: SqlAgentConfig, schema: str, question: str) -> list[Example]:
     """The examples whose question is most like `question`, at most `examples_k` and each at least
     `examples_min_score` similar, most similar first."""
-    name = collection_name(schema)
     vector = embedder.embed([question], cfg.embed, kind="query").vectors[0]
-    if store.client.get_collection(name).config.params.vectors.size != len(vector):
-        raise ValueError(f"The examples of '{schema}' were indexed with another embedding setup. Run `python -m rag_lab.sql examples --reindex`.")
-    hits = store.client.query_points(
-        name,
-        query=vector,
-        limit=cfg.examples_k,
-        score_threshold=cfg.examples_min_score,
-        query_filter=Filter(must=[FieldCondition(key="embed_key", match=MatchValue(value=embed_key(cfg.embed)))]),
-        with_payload=True,
-    ).points
-    return [Example(h.payload["example_id"], h.payload["question"], h.payload["sql"], h.score) for h in hits]
+    _check_size(store, schema, len(vector))
+    hits = store.query(collection_name(schema), vector, cfg.examples_k, filters={"embed_key": embed_key(cfg.embed)})
+    return [
+        Example(h.payload["example_id"], h.payload["question"], h.payload["sql"], h.score)
+        for h in hits
+        if h.score >= cfg.examples_min_score
+    ]
 
 
 def reindex(
@@ -144,16 +139,16 @@ def reindex(
 ) -> dict[str, int]:
     """Rebuild the collection of a schema (every schema when none is given) from the enabled examples in
     the table. Returns how many examples each schema has indexed."""
-    schemas = [schema] if schema else sorted({e["schema_name"] for e in metrics.list_sql_examples()} | {
+    found = metrics.list_sql_examples(schema)
+    schemas = [schema] if schema else sorted({e["schema_name"] for e in found} | {
         c.name.removeprefix(SQL_EXAMPLES_PREFIX)
         for c in store.client.get_collections().collections
         if c.name.startswith(SQL_EXAMPLES_PREFIX)
     })
     done = {}
     for name in schemas:
-        if store.client.collection_exists(collection_name(name)):
-            store.client.delete_collection(collection_name(name))
-        rows = [e for e in metrics.list_sql_examples(name) if e["enabled"]]
+        drop_index(store, name)
+        rows = [e for e in found if e["schema_name"] == name and e["enabled"]]
         _upsert(embedder, store, cfg, name, rows)
         done[name] = len(rows)
     return done

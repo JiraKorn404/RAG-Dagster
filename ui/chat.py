@@ -196,10 +196,10 @@ if not chat_id:
     chat_id = new_chat()
 locked = session is not None  # a chat that has a turn keeps what it searches
 if locked:
-    st.session_state["source"] = SOURCES[session["kind"]]
+    st.session_state["source"] = session["kind"]
     st.session_state["experiment" if session["kind"] == "documents" else "schema"] = owner
-elif st.session_state.get("source") not in SOURCES.values():
-    st.session_state["source"] = SOURCES["documents" if available or not schemas else "database"]
+elif st.session_state.get("source") not in SOURCES:
+    st.session_state["source"] = "documents" if available or not schemas else "database"
 for key, valid in (("experiment", by_name), ("schema", schema_by_name)):
     if st.session_state.get(key) not in valid:
         st.session_state.pop(key, None)
@@ -213,8 +213,7 @@ models = list(chat_models)
 target = None  # the experiment (a row) or the schema (its name) this chat searches
 with st.sidebar:
     st.subheader("Chat settings")
-    source = st.radio("Search in", list(SOURCES.values()), key="source", disabled=locked, help="Chosen before the first question, and fixed for the whole chat.")
-    kind = next(k for k, label in SOURCES.items() if label == source)
+    kind = st.radio("Search in", list(SOURCES), key="source", format_func=SOURCES.get, disabled=locked, help="Chosen before the first question, and fixed for the whole chat.")
     if locked:
         what = "the documents of" if kind == "documents" else "the tables of the schema"
         st.caption(f"This chat searches {what} `{owner}`. Start a new chat to search somewhere else.")

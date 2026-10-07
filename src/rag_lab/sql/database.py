@@ -17,7 +17,8 @@ from psycopg.conninfo import conninfo_to_dict
 from rag_lab.config import NAME_PATTERN
 from rag_lab.metrics.store import MetricsStore
 from rag_lab.paths import DATA_DIR
-from rag_lab.storage.qdrant import SQL_EXAMPLES_PREFIX, QdrantStore
+from rag_lab.sql.examples import drop_index
+from rag_lab.storage.qdrant import QdrantStore
 
 DATABASE = "rag_data"
 LOADER, READER = "rag_loader", "rag_reader"
@@ -61,10 +62,14 @@ def check_table_name(name: str) -> None:
         raise ValueError(f"'{name}' is not a usable table name.")
 
 
+def csv_dir(schema: str) -> Path:
+    return DATA_DIR / "csv" / schema
+
+
 def csv_path(schema: str, table: str) -> Path:
     """Where the CSV a table was imported from is kept, so it can be loaded again with other types."""
     check_table_name(table)
-    return DATA_DIR / "csv" / schema / f"{table}.csv"
+    return csv_dir(schema) / f"{table}.csv"
 
 
 def create_schema(metrics: MetricsStore, name: str, description: str = "") -> None:
@@ -82,16 +87,15 @@ def create_schema(metrics: MetricsStore, name: str, description: str = "") -> No
     metrics.add_db_schema(name, description)
 
 
-def drop_schema(metrics: MetricsStore, name: str, qdrant: QdrantStore | None = None) -> None:
-    """Drop a schema with everything in it, its good answers' collection in Qdrant when `qdrant` is given,
-    then its CSV copies and its registry rows (its chats and good answers go with them). The stores first,
-    the rows last, so a failure can be repeated."""
+def drop_schema(metrics: MetricsStore, name: str, qdrant: QdrantStore) -> None:
+    """Drop a schema with everything in it, its good answers' collection in Qdrant, then its CSV copies
+    and its registry rows (its chats and good answers go with them). The stores first, the rows last, so
+    a failure can be repeated."""
     check_schema_name(name)
-    if qdrant is not None and qdrant.client.collection_exists(SQL_EXAMPLES_PREFIX + name):
-        qdrant.delete_collection(SQL_EXAMPLES_PREFIX + name)
+    drop_index(qdrant, name)
     with psycopg.connect(loader_url()) as conn:
         conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
-    shutil.rmtree(csv_path(name, "x").parent, ignore_errors=True)  # the name passed check_schema_name
+    shutil.rmtree(csv_dir(name), ignore_errors=True)
     metrics.delete_db_schema(name)
 
 
@@ -99,6 +103,6 @@ def drop_table(metrics: MetricsStore, schema: str, table: str) -> None:
     """Drop an imported table, its CSV copy and its registry row, the data first so it can be repeated."""
     check_schema_name(schema)
     with psycopg.connect(loader_url()) as conn:
-        conn.execute(sql.SQL("DROP TABLE IF EXISTS {}.{}").format(sql.Identifier(schema), sql.Identifier(table)))
+        conn.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(schema, table)))
     csv_path(schema, table).unlink(missing_ok=True)
     metrics.delete_db_table(schema, table)

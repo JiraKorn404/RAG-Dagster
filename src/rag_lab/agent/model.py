@@ -4,7 +4,7 @@ import httpx
 from langchain_ollama import ChatOllama
 from langgraph.config import get_stream_writer
 
-from rag_lab.agent.events import AnswerToken, ModelState, Thinking
+from rag_lab.agent.events import AnswerToken, ModelState, Query, Thinking
 from rag_lab.config import ChatModelConfig
 
 
@@ -77,3 +77,25 @@ def call_model(
         )
     )
     return text, thinking
+
+
+def standalone_question(llm: ChatOllama, base_url: str, cfg: ChatModelConfig, state: dict, system: str, prompt) -> str:
+    """Every flow's condense step: the question made standalone from the last `history_turns` pairs of
+    the history (no call without history), reported as a Query. `prompt(question, history)` is the
+    flow's own condense prompt."""
+    question = state["question"]
+    history = state.get("history", [])[-2 * cfg.history_turns :]
+    text = question
+    if history:
+        text, _ = call_model(
+            llm,
+            base_url,
+            cfg,
+            "condense",
+            think=False,
+            stream=False,
+            messages=[("system", system), ("human", prompt(question, history))],
+        )
+        text = text.strip() or question
+    get_stream_writer()(Query(text, rewritten=text != question))
+    return text

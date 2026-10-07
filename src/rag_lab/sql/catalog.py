@@ -27,7 +27,6 @@ class SchemaText:
     schema: str
     text: str
     tables: list[str]
-    joins: list[str]  # the likely joins, as written in the text
 
     @property
     def chars(self) -> int:
@@ -110,7 +109,7 @@ def render(metrics: MetricsStore, schema: str) -> SchemaText:
     tables = metrics.list_db_tables(schema)
     head = f"Schema {quote(schema)}." + (f" {found['description'].strip()}" if found["description"].strip() else "")
     if not tables:
-        return SchemaText(schema, f"{head}\nIt has no tables.", [], [])
+        return SchemaText(schema, f"{head}\nIt has no tables.", [])
     blocks = [head]
     for table in tables:
         title = f"Table {quote(schema)}.{quote(table['table_name'])}: {table['row_count']:,} rows."
@@ -125,4 +124,4 @@ def render(metrics: MetricsStore, schema: str) -> SchemaText:
             if joins
             else "Likely joins: none found (no column has the same name and type in two tables)."
         )
-    return SchemaText(schema, "\n\n".join(blocks), [t["table_name"] for t in tables], joins)
+    return SchemaText(schema, "\n\n".join(blocks), [t["table_name"] for t in tables])

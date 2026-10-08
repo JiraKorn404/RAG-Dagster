@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
+import yaml
 from dagster import Config
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 
 NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
@@ -18,14 +21,34 @@ class _Section(Config):
 
 
 class ParseConfig(_Section):
-    # OCR and picture options are fixed off in the parser and deliberately not exposed.
+    # Docling's own OCR engines and its picture options are fixed off in the parser and not exposed.
     do_table_structure: bool = True
     table_mode: Literal["fast", "accurate"] = "accurate"
     table_cell_matching: bool = True
     do_formula_enrichment: bool = False
     do_code_enrichment: bool = False
     num_threads: int = 8
+    # How long Docling may take on one document: `document_timeout`, or `page_timeout` for each of its
+    # pages when that is longer (a 444-page book took 3 to 7 s a page here, more when the machine is
+    # busy, so 600 s cut it at page 38). A parse that runs out of time fails; it is never kept in part.
+    # `page_timeout` is left out of the config hash while it is the default.
     document_timeout: float = 600.0
+    page_timeout: float = 20.0
+    # Our OCR (parsing/ocr.py): a region Docling's layout found but that has no text layer is cropped
+    # from the page image and read by a vision model on Ollama. A page with a text layer keeps it. The
+    # `ocr*` settings are left out of the config hash while `ocr` is false, so the hashes of experiments
+    # made before it existed are unchanged.
+    ocr: bool = False
+    ocr_model: str = "glm-ocr:bf16"
+    ocr_scale: float = 2.0  # page image pixels per PDF point (2.0 is 144 dpi)
+    ocr_max_tokens: int = 4096  # per region; a region that reaches it is counted as cut
+    ocr_keep_alive: str = "30m"
+    # Pictures (parsing/pictures.py): each picture Docling found is cropped from the rendered page and
+    # kept as a file, and becomes a chunk of its own (chunking/pictures.py). The `picture*` settings
+    # are left out of the config hash while `pictures` is false.
+    pictures: bool = False
+    picture_scale: float = 2.0  # pixels per PDF point in the saved picture
+    picture_min_side: float = 50.0  # PDF points; a picture with a shorter side (a rule, a logo) is left out
 
 
 class HybridSettings(_Section):
@@ -67,6 +90,50 @@ class ChunkConfig(_Section):
     semantic: SemanticSettings = SemanticSettings()
 
 
+@dataclass(frozen=True)
+class EmbedFamily:
+    """What the embedding models of one family share. A model belongs to the family its Ollama name
+    starts with. Only a source of defaults: an experiment records every value it was made with."""
+
+    prefix: str
+    tokenizer: str  # Hugging Face id
+    query_template: str  # filled with {instruction} and {text}
+    document_template: str  # filled with {text}
+    dimensions: tuple[int, ...]  # sizes the vectors can be cut to (Matryoshka)
+    images: bool = False  # whether an image can be embedded, into the same space as text
+
+
+EMBED_FAMILIES = (
+    # Asymmetric: a query carries an instruction, a document is embedded as it is.
+    EmbedFamily(
+        prefix="qwen3-embedding",
+        tokenizer="Qwen/Qwen3-Embedding-0.6B",
+        query_template="Instruct: {instruction}\nQuery: {text}",
+        document_template="{text}",
+        dimensions=(256, 512, 768, 1024),
+    ),
+    # Both sides carry a fixed prefix (the model card's "search result" task); 768 is its native size.
+    EmbedFamily(
+        prefix="embeddinggemma-2",
+        tokenizer="google/embeddinggemma-2",
+        query_template="task: search result | query: {text}",
+        document_template="title: none | text: {text}",
+        dimensions=(128, 256, 512, 768),
+        images=True,
+    ),
+)
+
+
+def embed_family(model: str) -> EmbedFamily | None:
+    return next((f for f in EMBED_FAMILIES if model.startswith(f.prefix)), None)
+
+
+def embed_model_label(model: str) -> str:
+    """'qwen3-embedding:4b' -> '4b'; a model of another family keeps its whole name, so its size is not
+    read as a Qwen3 size."""
+    return model.split(":")[-1] if model.startswith("qwen3-embedding") else model
+
+
 class EmbedConfig(_Section):
     model: str = "qwen3-embedding:0.6b"
     tokenizer: str = "Qwen/Qwen3-Embedding-0.6B"  # Hugging Face id; chunk sizes are counted with it
@@ -75,7 +142,32 @@ class EmbedConfig(_Section):
     query_instruction: str = (
         "Given a question, retrieve relevant passages from the documents that answer it"
     )
+    # How a query and a document are written before they are embedded. The defaults are Qwen3's, and
+    # are left out of the config hash, so the hashes of experiments made before they existed are
+    # unchanged. Another family needs its own (see EMBED_FAMILIES and `for_model`): the wrong ones still
+    # give vectors, only worse ones.
+    query_template: str = "Instruct: {instruction}\nQuery: {text}"
+    document_template: str = "{text}"
+    # What a picture chunk is embedded from: the image with its text (its caption) as one input, the
+    # image alone, or the text alone (which needs no model that takes images, and is the baseline that
+    # says whether the image adds anything). Only used, and only in the config hash, with `parse.pictures`.
+    picture_input: Literal["image+caption", "image", "caption"] = "image+caption"
     keep_alive: str = "30m"
+
+    @classmethod
+    def for_model(cls, model: str, **settings) -> "EmbedConfig":
+        """The settings for an Ollama model of a known family: its tokenizer and its templates."""
+        family = embed_family(model)
+        if family is None:
+            known = ", ".join(f.prefix for f in EMBED_FAMILIES)
+            raise ValueError(f"'{model}' is not of a known embedding family ({known})")
+        return cls(
+            model=model,
+            tokenizer=family.tokenizer,
+            query_template=family.query_template,
+            document_template=family.document_template,
+            **settings,
+        )
 
 
 class IndexConfig(_Section):
@@ -144,6 +236,10 @@ class AgentConfig(ChatModelConfig):
     max_rewrites: int = 1  # different queries tried when the chunks do not answer it, before giving up
     # How the documents are searched. The 4B reranker works; the 0.6B builds give every chunk 0.0.
     search: SearchConfig = SearchConfig(method="hybrid+rerank", reranker="dengcao/Qwen3-Reranker-4B:Q8_0")
+    # A picture among the chunks is given to the answer model as an image, not only as its caption. The
+    # model must take images. Each one costs context, so only the first `max_pictures` by rank are given.
+    show_pictures: bool = True
+    max_pictures: int = 2
 
 
 class SqlAgentConfig(ChatModelConfig):
@@ -197,6 +293,18 @@ class ExperimentConfig(_Section):
     # of the hash, which keeps every hash from before `tag` existed.
     tag: str | None = None
 
+    @model_validator(mode="after")
+    def _pictures_need_a_model_that_takes_images(self):
+        if self.parse.pictures and self.embed.picture_input != "caption":
+            family = embed_family(self.embed.model)
+            if family is None or not family.images:
+                raise ValueError(
+                    f"`parse.pictures` with `embed.picture_input` = '{self.embed.picture_input}' needs an "
+                    f"embedding model that takes images, and '{self.embed.model}' does not. Use one that "
+                    "does (embeddinggemma-2), or set `embed.picture_input` to 'caption'."
+                )
+        return self
+
     @property
     def collection(self) -> str:
         return self.name
@@ -219,7 +327,48 @@ class ExperimentConfig(_Section):
             data["chunk"].pop("engine")  # keeps the hashes of the experiments run before `engine` existed
         if not self.index.sparse:
             data["index"].pop("sparse")  # keeps the hashes of the experiments made before `sparse` existed
+        if data["parse"]["page_timeout"] == ParseConfig.model_fields["page_timeout"].default:
+            data["parse"].pop("page_timeout")  # keeps the hashes of the experiments made before it existed
+        if not self.parse.ocr:
+            for key in [k for k in data["parse"] if k.startswith("ocr")]:
+                data["parse"].pop(key)  # keeps the hashes of the experiments made before OCR existed
+        for key in ("query_template", "document_template"):
+            if data["embed"][key] == EmbedConfig.model_fields[key].default:
+                data["embed"].pop(key)  # keeps the hashes of the experiments made before the templates existed
+        if not self.parse.pictures:  # keeps the hashes of the experiments made before pictures existed
+            for key in [k for k in data["parse"] if k.startswith("picture")]:
+                data["parse"].pop(key)
+            data["embed"].pop("picture_input")
         if not (with_tag and self.tag):
             data.pop("tag")
         payload = json.dumps(data, sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def load_experiment_file(path: str | Path) -> ExperimentConfig:
+    """An experiment written as YAML (config/ingest.yaml): the keys of ExperimentConfig, where a key
+    left out keeps its default and an unknown key is an error. Two things are filled in, as the pages
+    do: `tag` is the name unless given, so the experiment has a hash of its own, and a model named
+    under `embed` brings its family's tokenizer and templates unless the file sets them. A model of
+    no known family is refused unless the file sets all three itself."""
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected settings as `key: value`, found {type(data).__name__}")
+    data.setdefault("tag", data.get("name"))
+    embed = data.get("embed")
+    if isinstance(embed, dict) and "model" in embed:
+        family = embed_family(str(embed["model"]))
+        own = ("tokenizer", "query_template", "document_template")
+        if family is not None:
+            data["embed"] = {**{key: getattr(family, key) for key in own}, **embed}
+        elif not all(key in embed for key in own):
+            known = ", ".join(f.prefix for f in EMBED_FAMILIES)
+            raise ValueError(
+                f"{path}: embed.model '{embed['model']}' is not of a known embedding family ({known}). "
+                f"Check the name, or set embed.{', embed.'.join(own)} for it."
+            )
+    try:
+        return ExperimentConfig.model_validate(data)
+    except ValidationError as e:
+        problems = "; ".join(f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors())
+        raise ValueError(f"{path}: {problems}") from e

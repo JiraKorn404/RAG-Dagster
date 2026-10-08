@@ -84,7 +84,7 @@ with st.form("query"):
     query = st.text_input("Question", placeholder="How does multi-head attention work?")
     c1, c2 = st.columns([3, 1])
     top_k = c1.slider("Chunks to return (top k)", 1, 20, 5)
-    modality = c2.radio("Content", ["any", "text", "table"], horizontal=True)
+    modality = c2.radio("Content", ["any", "text", "table", "picture"], horizontal=True)
     submitted = st.form_submit_button("Search", type="primary", width="stretch")
 
 if submitted and query.strip():

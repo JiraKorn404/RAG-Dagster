@@ -231,11 +231,13 @@ with st.sidebar:
     else:
         st.info("No schema exists yet. Import a CSV file on the Database page.")
     model = st.selectbox("Chat model", models, index=models.index(defaults.model) if defaults.model in models else 0)
-    think = st.toggle("Thinking", value=defaults.think and chat_models[model], disabled=not chat_models[model], help="The model thinks before it answers (or, for a database, before it writes the SQL), and the page shows it. Slower.")
+    can_think, can_see = "thinking" in chat_models[model], "vision" in chat_models[model]
+    think = st.toggle("Thinking", value=defaults.think and can_think, disabled=not can_think, help="The model thinks before it answers (or, for a database, before it writes the SQL), and the page shows it. Slower.")
     if kind == "documents":
         rerank_model = st.selectbox("Reranker", rerankers or ["none installed"], index=rerankers.index(defaults.search.reranker) if defaults.search.reranker in rerankers else 0)
         top_k = st.slider("Chunks given to the model (top k)", 1, 10, defaults.top_k)
         candidates = int(st.number_input("Candidates", min_value=1, max_value=100, value=defaults.search.candidates, help="Hits the reranker scores; one call to Ollama each."))
+        show_pictures = st.toggle("Show pictures to the model", value=defaults.show_pictures and can_see, disabled=not can_see, help=f"When a retrieved chunk is a picture, the model is given the image and not only its caption (the first {defaults.max_pictures} of a turn). Only an experiment made with *Index the pictures* has picture chunks.")
         st.caption("Search: hybrid (dense and BM25 keywords) with reranking.")
     else:
         st.caption("The model is given the whole schema, writes one SELECT, and a check and the database confirm it before it runs, read-only.")
@@ -319,6 +321,7 @@ if question and question.strip():
             think=think,
             top_k=top_k,
             search=SearchConfig(method="hybrid+rerank", reranker=rerank_model, candidates=candidates),
+            show_pictures=show_pictures and can_see,
         )
         graph = build_graph(experiment, embedder, qdrant, reranker, base_url, cfg)
         flow = DocumentsFlow(experiment, cfg)

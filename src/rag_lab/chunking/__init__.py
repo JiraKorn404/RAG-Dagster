@@ -7,6 +7,7 @@ from rag_lab.chunking import fixed, native, recursive, semantic  # noqa: F401  (
 from rag_lab.chunking.base import REGISTRY, ChunkContext
 from rag_lab.chunking.llamaindex import chunk_llamaindex
 from rag_lab.chunking.models import Chunk
+from rag_lab.chunking.pictures import picture_chunks
 from rag_lab.chunking.tokens import load_tokenizer
 from rag_lab.config import ExperimentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
@@ -23,6 +24,8 @@ def chunk_document(
         ctx.warnings.append(f"overlap is only used by 'fixed'; ignored for '{strategy}'")
 
     chunks = chunk_llamaindex(ctx) if cfg.chunk.engine == "llamaindex" else REGISTRY[strategy](ctx)
+    if cfg.parse.pictures:
+        chunks = chunks + picture_chunks(ctx)
     for i, chunk in enumerate(chunks):
         chunk.chunk_id = f"{doc_id}:{i:05d}"
         chunk.token_count = ctx.tokens.count(chunk.text)

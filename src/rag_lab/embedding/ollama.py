@@ -1,10 +1,11 @@
+import base64
 import time
 from dataclasses import dataclass
 from typing import Literal
 
 import httpx
 
-from rag_lab.config import EmbedConfig
+from rag_lab.config import EmbedConfig, embed_family
 from rag_lab.embedding.vectors import truncate_and_normalise
 
 
@@ -26,19 +27,40 @@ class OllamaEmbedder:
 
     def embed(
         self,
-        texts: list[str],
+        texts: list[str | None],
         cfg: EmbedConfig,
         kind: Literal["document", "query"] = "document",
+        images: list[bytes | None] | None = None,
     ) -> EmbedResult:
-        """Qwen3 is asymmetric: queries get an instruction prefix, documents are sent as-is."""
+        """A query and a document are written differently, as the model's family expects: Qwen3 gives a
+        query an instruction and sends a document as it is, EmbeddingGemma 2 prefixes both.
+
+        `images` (PNG or JPEG bytes, one entry per text, None where there is none) makes an input an
+        image, alone when its text is None, or together with its text as one vector. An image gets no
+        template. It goes inside `input` as an object: a top-level `images` field, as the chat API has,
+        is accepted by Ollama and silently ignored."""
+        images = images or [None] * len(texts)
+        if any(images):
+            family = embed_family(cfg.model)
+            if family is None or not family.images:
+                raise ValueError(f"The embedding model '{cfg.model}' does not take images")
         if kind == "query":
-            texts = [f"Instruct: {cfg.query_instruction}\nQuery: {t}" for t in texts]
+            written = [cfg.query_template.format(instruction=cfg.query_instruction, text=t) for t in texts]
+        else:
+            written = [None if t is None else cfg.document_template.format(text=t) for t in texts]
+        inputs: list[str | dict] = []
+        for text, image in zip(written, images, strict=True):
+            if image is None:
+                inputs.append(text)
+            else:
+                item = {"image": base64.b64encode(image).decode()}
+                inputs.append(item if text is None else {"text": text, **item})
 
         start = time.perf_counter()
         vectors: list[list[float]] = []
         ollama_ns = load_ns = tokens = batches = 0
-        for i in range(0, len(texts), cfg.batch_size):
-            data = self._post_embed(texts[i : i + cfg.batch_size], cfg)
+        for i in range(0, len(inputs), cfg.batch_size):
+            data = self._post_embed(inputs[i : i + cfg.batch_size], cfg)
             vectors.extend(data["embeddings"])
             ollama_ns += data.get("total_duration", 0)
             load_ns += data.get("load_duration", 0)
@@ -54,7 +76,7 @@ class OllamaEmbedder:
             batches=batches,
         )
 
-    def _post_embed(self, batch: list[str], cfg: EmbedConfig) -> dict:
+    def _post_embed(self, batch: list[str | dict], cfg: EmbedConfig) -> dict:
         body = {"model": cfg.model, "input": batch, "keep_alive": cfg.keep_alive}
         for attempt in range(self.retries):
             try:

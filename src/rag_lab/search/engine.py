@@ -24,6 +24,8 @@ class Hit:
     headings: list[str]
     doc_id: str
     chunk_id: str
+    # A picture chunk's file, relative to data/artifacts: "<experiment>/parse/<doc_id>.pictures/<n>.png"
+    image: str | None = None
 
 
 @dataclass
@@ -111,6 +113,7 @@ def search(
             headings=p.payload.get("headings") or [],
             doc_id=p.payload["doc_id"],
             chunk_id=p.payload["chunk_id"],
+            image=f"{config.name}/parse/{p.payload['image']}" if p.payload.get("image") else None,
         )
         for rank, (p, score) in enumerate(zip(points, scores), start=1)
     ]

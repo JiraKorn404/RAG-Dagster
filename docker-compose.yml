@@ -4,6 +4,8 @@ x-dagster-env: &dagster-env
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
   OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
   DATA_DIR: /app/data
+  # The experiment a PDF put into data/raw is ingested with; the sensor reads it at every tick.
+  INGEST_CONFIG: /app/config/ingest.yaml
   # LlamaIndex's sentence splitter downloads NLTK data on first use; keep it in the model_cache volume.
   NLTK_DATA: /root/.cache/nltk_data
   QDRANT_URL: http://qdrant:6333
@@ -49,9 +51,12 @@ services:
     volumes:
       - ./src:/app/src
       - ./data:/app/data
+      - ./config:/app/config:ro
       # Docling model downloads (Hugging Face + Docling's own cache) land here, not in the image.
       - model_cache:/root/.cache
       - dagster_storage:/opt/dagster/storage
+      # The instance settings are mounted over the copy in the image, so an edit needs a restart, not a build.
+      - ./docker/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,6 +71,7 @@ services:
       - "127.0.0.1:3000:3000"
     volumes:
       - dagster_storage:/opt/dagster/storage
+      - ./docker/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,6 +84,7 @@ services:
     environment: *dagster-env
     volumes:
       - dagster_storage:/opt/dagster/storage
+      - ./docker/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
     depends_on:
       postgres:
         condition: service_healthy

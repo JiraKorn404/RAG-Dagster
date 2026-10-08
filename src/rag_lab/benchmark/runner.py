@@ -20,7 +20,14 @@ from docling_core.types.doc import DoclingDocument
 from rag_lab.chunking import chunk_document, summarise
 from rag_lab.chunking.models import Chunk
 from rag_lab.chunking.segment import reference_text, segment
-from rag_lab.config import ChunkConfig, EmbedConfig, ExperimentConfig, IndexConfig, SearchConfig
+from rag_lab.config import (
+    ChunkConfig,
+    EmbedConfig,
+    ExperimentConfig,
+    IndexConfig,
+    SearchConfig,
+    embed_model_label,
+)
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.ingest import clean_experiment_name, ingest_document
 from rag_lab.library import delete_experiment
@@ -96,8 +103,8 @@ class Services:
 
 
 def model_slug(model: str) -> str:
-    """'qwen3-embedding:0.6b' -> '0-6b'."""
-    return re.sub(r"[^a-z0-9]+", "-", model.split(":")[-1].lower()).strip("-")
+    """'qwen3-embedding:0.6b' -> '0-6b'; 'embeddinggemma-2:740m' -> 'embeddinggemma-2-740m'."""
+    return re.sub(r"[^a-z0-9]+", "-", embed_model_label(model).lower()).strip("-")
 
 
 def experiment_name(document_name: str, report_id: str, model: str, strategy: str) -> str:
@@ -109,7 +116,7 @@ def experiment_config(settings: BenchmarkSettings, name: str, model: str, strate
     return ExperimentConfig(
         name=name,
         tag=name,  # its own hash even when another experiment has the same settings
-        embed=EmbedConfig(model=model),
+        embed=EmbedConfig.for_model(model),
         index=IndexConfig(sparse=any(m.startswith("hybrid") for m in settings.search_methods)),
         chunk=ChunkConfig(
             engine=settings.engine,

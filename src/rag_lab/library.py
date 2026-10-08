@@ -84,8 +84,12 @@ def delete_document(name: str, doc_id: str, metrics: MetricsStore, qdrant: Qdran
     if folder is not None:
         for stage in ARTIFACT_STAGES:
             for path in (folder / stage).glob(f"{doc_id}.*"):
-                path.unlink()
-                files += 1
+                if path.is_dir():  # <doc_id>.pictures, the document's picture files
+                    files += sum(1 for p in path.iterdir() if p.is_file())
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                    files += 1
     rows = 0
     found = metrics.get_experiment(name)
     if found is not None:

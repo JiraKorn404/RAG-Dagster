@@ -36,18 +36,38 @@ def condense_prompt(question: str, history: list[tuple[str, str]]) -> str:
     return f"Conversation so far:\n{turns}\n\nLatest question: {question}\n\nStandalone query:"
 
 
-def passage(number: int, hit: Hit) -> str:
+def passage(number: int, hit: Hit, image: int | None = None) -> str:
     where = hit.source_file or hit.doc_id
     if hit.page:
         where += f", page {hit.page}"
     if hit.headings:
         where += f", {' > '.join(hit.headings)}"
-    return f"[{number}] ({where})\n{hit.text}"
+    text = hit.text
+    if image:
+        text = (
+            f"Passage [{number}] is a picture from the document. It is attached to this message as "
+            f"image {image}: look at it. Its caption:\n{text}"
+        )
+    return f"[{number}] ({where})\n{text}"
 
 
-def answer_prompt(question: str, hits: list[Hit]) -> str:
-    passages = "\n\n".join(passage(i, hit) for i, hit in enumerate(hits, start=1)) or "(none found)"
-    return f"Passages:\n\n{passages}\n\nQuestion: {question}"
+def answer_prompt(question: str, hits: list[Hit], images: dict[int, int] | None = None) -> str:
+    """`images` says which passages are pictures attached to the message: passage number -> which image.
+    Each attached picture also has its passage number written on it (graph.py: labelled), which is what
+    makes the model cite it by number; the words here did not."""
+    images = images or {}
+    passages = (
+        "\n\n".join(passage(i, hit, images.get(i)) for i, hit in enumerate(hits, start=1)) or "(none found)"
+    )
+    note = ""
+    if images:
+        which = "; ".join(f"what image {image} shows is cited as [{number}]" for number, image in images.items())
+        note = (
+            "\n\nUse what the attached pictures show, including the labels, numbers and tables in them. "
+            f"A picture is cited by its passage number: {which}. Passage numbers in square brackets are "
+            "the only citations; never write [image], [table] or [figure]."
+        )
+    return f"Passages:\n\n{passages}\n\nQuestion: {question}{note}"
 
 
 def grade_prompt(question: str, hits: list[Hit]) -> str:

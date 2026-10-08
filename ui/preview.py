@@ -40,6 +40,7 @@ def document_html(text: str, chunks: list, lo: int, hi: int) -> str:
         points.update(p for p in (s, e) if lo < p < hi)
     for s, e in regions:
         points.update(p for p in (s, e) if lo < p < hi)
+    points.update(at for _, at in empty if lo < at < hi)  # a picture sits inside a chunk's text
     ordered = sorted(points)
 
     out: list[str] = []
@@ -56,8 +57,9 @@ def document_html(text: str, chunks: list, lo: int, hi: int) -> str:
                 marks.append(f'<span class="cut cut-ap">{html.escape(label)} (approximate)</span>')
         for i, at in empty:
             if at == a and (a < hi or hi == len(text)):
+                what = "picture" if chunks[i].modality == "picture" else "no source text"
                 marks.append(
-                    f'<span class="cut cut-none">#{i + 1} · no source text ({html.escape(chunks[i].text.strip()[:40])})</span>'
+                    f'<span class="cut cut-none">#{i + 1} · {what} ({html.escape(chunks[i].text.strip()[-40:])})</span>'
                 )
         if n == len(ordered) - 1:
             out.extend(marks)  # marks at the very end of the text
@@ -77,8 +79,9 @@ def document_html(text: str, chunks: list, lo: int, hi: int) -> str:
     return f'<div class="doc">{"".join(out)}</div>'
 
 
-def embedded_html(chunks: list, first: int) -> str:
-    """One block per chunk, with the stored text (its headings prefix dimmed)."""
+def embedded_html(chunks: list, first: int, picture=lambda chunk: "") -> str:
+    """One block per chunk, with the stored text (its headings prefix dimmed). `picture` gives the
+    HTML of a picture chunk's image."""
     blocks = []
     for offset, c in enumerate(chunks):
         i = first + offset
@@ -94,6 +97,7 @@ def embedded_html(chunks: list, first: int) -> str:
             f'<div class="badges"><span class="badge {c.modality}">{c.modality}</span>'
             f'<span class="badge page">{html.escape(where)}</span></div>'
             + (f'<div class="heading">{html.escape(" › ".join(c.headings))}</div>' if c.headings else "")
+            + (picture(c) if c.image else "")
             + f'<pre class="chunktext">{body}</pre></div>'
         )
     return "".join(blocks)

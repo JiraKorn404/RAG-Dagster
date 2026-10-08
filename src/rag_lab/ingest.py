@@ -23,11 +23,14 @@ from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.embedding.sparse import document_vectors
 from rag_lab.metrics.store import MetricsStore
 from rag_lab.parsing.parse import ParsedDocument, parse_pdf
+from rag_lab.parsing.pictures import pictures_dir
 from rag_lab.paths import DATA_DIR, artifacts_dir
 from rag_lab.storage.qdrant import QdrantStore, to_point_id
 
 # Below this many extracted characters per page, the PDF is almost certainly scanned images.
 SCANNED_PDF_CHARS_PER_PAGE = 50
+# What the parse stage row says about OCR, when the experiment has it on.
+OCR_DETAILS = ("ocr_regions", "ocr_pages", "ocr_seconds", "ocr_output_tokens", "ocr_cut_regions")
 
 
 class IngestError(Exception):
@@ -39,6 +42,19 @@ def register_experiment(store: MetricsStore, config: ExperimentConfig) -> str:
     config_hash = config.config_hash()
     store.upsert_experiment(config_hash, config.name, config.model_dump(mode="json"))
     return config_hash
+
+
+def experiment_conflict(store: MetricsStore, config: ExperimentConfig) -> str | None:
+    """Why documents cannot be ingested under `config.name`, or None when they can: the name is free,
+    or it is this same experiment. An experiment's collection holds one set of settings, so the same
+    name with other settings is refused instead of mixing them."""
+    found = store.get_experiment(config.name)
+    if found is None or found[0] == config.config_hash():
+        return None
+    return (
+        f"An experiment named '{config.name}' already exists with other settings. Settings cannot change "
+        "under the same name: choose a new `name` (a new experiment), or put the settings back."
+    )
 
 
 def check_new_experiment_name(store: MetricsStore, qdrant: QdrantStore, name: str) -> str | None:
@@ -87,13 +103,20 @@ def save_upload(name: str, content: bytes) -> tuple[str, Path]:
     return doc_id, path
 
 
-def ensure_parsed(path: Path, doc_id: str) -> tuple[Path, dict]:
+def ensure_parsed(
+    path: Path,
+    doc_id: str,
+    ocr: bool = False,
+    ollama_url: str | None = None,
+    on_ocr_page: Callable[[int, int], None] = lambda done, total: None,
+) -> tuple[Path, dict]:
     """The Docling parse of an uploaded document with default settings, made once and kept in
-    data/artifacts/_uploads/<doc_id>/. Returns that folder and the parse metadata."""
-    parse_dir = artifacts_dir("_uploads", doc_id)
+    data/artifacts/_uploads/<doc_id>/, or in its `ocr` folder for the parse with OCR (the other
+    settings still the defaults). Returns that folder and the parse metadata."""
+    parse_dir = artifacts_dir("_uploads", f"{doc_id}/ocr" if ocr else doc_id)
     meta_path = parse_dir / f"{doc_id}.meta.json"
     if not (parse_dir / f"{doc_id}.json").exists() or not meta_path.exists():
-        parse_pdf(path, doc_id, ParseConfig(), parse_dir)
+        parse_pdf(path, doc_id, ParseConfig(ocr=ocr), parse_dir, ollama_url, on_ocr_page)
     return parse_dir, json.loads(meta_path.read_text(encoding="utf-8"))
 
 
@@ -123,6 +146,8 @@ def ingest_document(
     target = artifacts_dir(name, "parse")
     for suffix in (".json", ".md"):
         shutil.copy(parse_dir / f"{doc_id}{suffix}", target / f"{doc_id}{suffix}")
+    if config.parse.pictures:
+        shutil.copytree(parse_dir / pictures_dir(doc_id), target / pictures_dir(doc_id), dirs_exist_ok=True)
     stored = {**meta, "source_file": source_name}
     (target / f"{doc_id}.meta.json").write_text(json.dumps(stored, indent=2), encoding="utf-8")
 
@@ -163,6 +188,7 @@ def record_parse(
             "text_items": parsed.text_items,
             "chars_per_page": parsed.chars_per_page,
             "model_load_seconds": parsed.model_load_seconds,
+            **({k: getattr(parsed, k) for k in OCR_DETAILS} if config.parse.ocr else {}),
         },
         dagster_run_id=run_id,
     )
@@ -211,8 +237,16 @@ def embed_chunks(
     if not chunk_path.exists():
         raise IngestError(f"No chunks at {chunk_path}. Materialise `chunks` first (same experiment name).")
 
-    texts = [c.text for c in read_chunks(chunk_path)]
-    result = embedder.embed(texts, config.embed, kind="document")
+    rows = read_chunks(chunk_path)
+    texts: list[str | None] = [c.text for c in rows]
+    images = None
+    pictures = sum(1 for c in rows if c.image)
+    if pictures and config.embed.picture_input != "caption":
+        parse_dir = artifacts_dir(config.name, "parse")
+        images = [(parse_dir / c.image).read_bytes() if c.image else None for c in rows]
+        if config.embed.picture_input == "image":
+            texts = [None if c.image else c.text for c in rows]
+    result = embedder.embed(texts, config.embed, kind="document", images=images)
     vectors = np.array(result.vectors, dtype=np.float32)
     np.save(artifacts_dir(config.name, "embed") / f"{doc_id}.npy", vectors)
 
@@ -227,6 +261,9 @@ def embed_chunks(
         "ollama_ms": round(result.ollama_ms, 1),
         "model_load_ms": round(result.load_ms, 1),
     }
+    if pictures:
+        details["pictures"] = pictures
+        details["picture_input"] = config.embed.picture_input
     store.add_stage_metric(
         config.config_hash(),
         doc_id,
@@ -291,6 +328,7 @@ def index_chunks(
             "config_hash": config_hash,
             "source_file": source_file,
             "ingested_at": ingested_at,
+            **({"image": c.image} if c.image else {}),
         }
         for c in rows
     ]

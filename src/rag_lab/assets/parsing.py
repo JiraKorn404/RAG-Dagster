@@ -2,17 +2,21 @@ from dagster import AssetExecutionContext, Failure, MaterializeResult, MetadataV
 
 from rag_lab.assets.partitions import documents_partitions
 from rag_lab.documents import scan_raw
-from rag_lab.ingest import SCANNED_PDF_CHARS_PER_PAGE, record_parse, register_experiment
+from rag_lab.ingest import OCR_DETAILS, SCANNED_PDF_CHARS_PER_PAGE, record_parse, register_experiment
 from rag_lab.parsing.parse import parse_pdf
 from rag_lab.paths import artifacts_dir
-from rag_lab.resources import ExperimentResource, MetricsStoreResource
+from rag_lab.resources import ExperimentResource, MetricsStoreResource, OllamaResource
 
 
 @asset(partitions_def=documents_partitions, group_name="ingestion")
 def parsed_document(
-    context: AssetExecutionContext, experiment: ExperimentResource, metrics: MetricsStoreResource
+    context: AssetExecutionContext,
+    experiment: ExperimentResource,
+    metrics: MetricsStoreResource,
+    ollama: OllamaResource,
 ) -> MaterializeResult:
-    """Docling parse of one PDF. Output goes to data/artifacts/<experiment>/parse/."""
+    """Docling parse of one PDF. Output goes to data/artifacts/<experiment>/parse/. Ollama is only
+    called when the experiment has `parse.ocr` on."""
     config = experiment.config()
     doc_id = context.partition_key
     path = scan_raw().get(doc_id)
@@ -22,11 +26,22 @@ def parsed_document(
     store = metrics.store()
     config_hash = register_experiment(store, config)
 
-    parsed = parse_pdf(path, doc_id, config.parse, artifacts_dir(config.name, "parse"))
+    parsed = parse_pdf(
+        path,
+        doc_id,
+        config.parse,
+        artifacts_dir(config.name, "parse"),
+        ollama.base_url,
+        lambda done, total: context.log.info(f"OCR: page {done} of the {total} that need it"),
+    )
     if parsed.chars_per_page < SCANNED_PDF_CHARS_PER_PAGE:
         context.log.warning(
-            f"{path.name}: only {parsed.chars_per_page} characters per page. This looks like a "
-            "scanned PDF; OCR is off, so there is little text to ingest."
+            f"{path.name}: only {parsed.chars_per_page} characters per page. "
+            + (
+                "OCR was on and found little text."
+                if config.parse.ocr
+                else "This looks like a scanned PDF; set `parse.ocr` to read it."
+            )
         )
 
     record_parse(store, config, doc_id, parsed, context.run_id)
@@ -44,6 +59,7 @@ def parsed_document(
             "parse_seconds": parsed.parse_seconds,
             "pages_per_second": parsed.pages_per_second,
             "model_load_seconds": parsed.model_load_seconds,
+            **({k: getattr(parsed, k) for k in OCR_DETAILS} if config.parse.ocr else {}),
             "markdown_preview": MetadataValue.md(parsed.markdown_preview),
         }
     )

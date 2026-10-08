@@ -6,11 +6,7 @@ from statistics import fmean
 
 from rag_lab.benchmark.runner import QUALITY_KS, result_searches
 from rag_lab.config import SEARCH_METHODS
-
-
-def model_label(model: str) -> str:
-    """'qwen3-embedding:4b' -> '4b'."""
-    return model.split(":")[-1]
+from rag_lab.config import embed_model_label as model_label
 
 
 @dataclass

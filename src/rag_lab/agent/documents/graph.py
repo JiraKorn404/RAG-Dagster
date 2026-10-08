@@ -9,9 +9,13 @@ of the answer.
 Every node reports what it does as events (agent/events.py) through LangGraph's custom stream;
 `agent.run()` is the way to use the graph, with a `DocumentsFlow` that says what a saved turn needs."""
 
+import base64
+import io
 from dataclasses import asdict
 from typing import TypedDict
 
+from langchain_core.messages import HumanMessage
+from PIL import Image, ImageDraw, ImageFont
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
@@ -32,8 +36,9 @@ from rag_lab.agent.run import Summary, step
 from rag_lab.config import AgentConfig, ExperimentConfig
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.metrics.store import MetricsStore
+from rag_lab.paths import DATA_DIR
 from rag_lab.reranking import OllamaReranker
-from rag_lab.search import SearchResult, search
+from rag_lab.search import Hit, SearchResult, search
 from rag_lab.storage.qdrant import QdrantStore
 
 
@@ -49,6 +54,34 @@ class AgentState(TypedDict, total=False):
     abstained: bool
     answer: str
     thinking: str  # the model's thinking while it wrote the answer; empty when `think` is off
+
+
+def labelled(picture: bytes, number: int) -> bytes:
+    """The picture as a PNG with "Passage [n]" written on a white strip above it. The 4B model reads a
+    picture correctly but does not take it for a numbered passage whatever the prompt says (it cites
+    "[Table in the image]"); with the number in the image it cites it as [n]."""
+    image = Image.open(io.BytesIO(picture)).convert("RGB")
+    strip = max(image.height // 12, 40)
+    out = Image.new("RGB", (image.width, image.height + strip), "white")
+    out.paste(image, (0, strip))
+    font = ImageFont.load_default(size=strip * 2 // 3)
+    ImageDraw.Draw(out).text((12, strip // 6), f"Passage [{number}]", fill="black", font=font)
+    buffer = io.BytesIO()
+    out.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def shown_pictures(hits: list[Hit], cfg: AgentConfig) -> dict[int, bytes]:
+    """The pictures the answer model is given: passage number -> the picture with that number written
+    on it, for the first `max_pictures` picture hits by rank whose file is still there. Empty when
+    `show_pictures` is off."""
+    shown: dict[int, bytes] = {}
+    if cfg.show_pictures:
+        for number, hit in enumerate(hits, start=1):
+            path = DATA_DIR / "artifacts" / hit.image if hit.image else None
+            if path and path.is_file() and len(shown) < cfg.max_pictures:
+                shown[number] = labelled(path.read_bytes(), number)
+    return shown
 
 
 def build_graph(
@@ -139,6 +172,15 @@ def build_graph(
 
     @step
     def generate(state: AgentState) -> dict:
+        hits = state["retrieval"].hits
+        pictures = shown_pictures(hits, cfg)
+        prompt = answer_prompt(state["standalone"], hits, {n: i for i, n in enumerate(pictures, start=1)})
+        content: str | list = prompt
+        if pictures:  # the text, then the images in the order the prompt numbers them
+            content = [{"type": "text", "text": prompt}] + [
+                {"type": "image_url", "image_url": f"data:image/png;base64,{base64.b64encode(data).decode()}"}
+                for data in pictures.values()
+            ]
         answer, thinking = call_model(
             answer_llm,
             base_url,
@@ -146,10 +188,7 @@ def build_graph(
             "generate",
             think=cfg.think,
             stream=True,
-            messages=[
-                ("system", ANSWER_SYSTEM),
-                ("human", answer_prompt(state["standalone"], state["retrieval"].hits)),
-            ],
+            messages=[("system", ANSWER_SYSTEM), HumanMessage(content=content)],
         )
         return {"answer": answer, "thinking": thinking}
 

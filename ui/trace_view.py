@@ -157,6 +157,8 @@ def settings_line(settings: dict | None) -> str:
             f"top {settings['top_k']}",
             f"context {settings['num_ctx']}",
         ]
+        if settings.get("show_pictures"):
+            parts.append(f"up to {settings['max_pictures']} pictures shown to the model")
     elif "row_limit" in settings:  # a database turn
         parts += [
             f"context {settings['num_ctx']}",
@@ -273,8 +275,15 @@ def show_trace(trace: dict) -> None:
             else:
                 st.caption("The number on a card is the passage number the answer cites. Score: the reranker's probability that the chunk answers the question.")
                 cited = done.cited if done else []
+                # the pictures the model was given: the rule of agent.documents.graph.shown_pictures
+                settings = trace["settings"] or {}
+                pictures = [h.rank for h in retrieved.hits if h.image] if settings.get("show_pictures") else []
+                seen = set(pictures[: settings.get("max_pictures", 0)])
                 st.markdown(
-                    "".join(hit_card(h, style.MODEL_COLORS[0], cited=h.rank in cited) for h in retrieved.hits),
+                    "".join(
+                        hit_card(h, style.MODEL_COLORS[0], cited=h.rank in cited, seen=h.rank in seen)
+                        for h in retrieved.hits
+                    ),
                     unsafe_allow_html=True,
                 )
 

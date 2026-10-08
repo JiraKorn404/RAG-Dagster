@@ -23,6 +23,7 @@ dependencies = [
     "langgraph",
     "langchain-ollama",
     "sqlglot",  # parses a generated query to check it before it runs (src/rag_lab/sql/guard.py)
+    "pyyaml",  # config/ingest.yaml, the experiment the sensor ingests new PDFs with
 ]
 
 [dependency-groups]

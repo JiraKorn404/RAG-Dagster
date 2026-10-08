@@ -19,3 +19,11 @@ compute_logs:
   class: LocalComputeLogManager
   config:
     base_dir: /opt/dagster/storage/compute_logs
+
+# One run at a time: every ingest run loads Docling's models, and there is one Ollama. PDFs that arrive
+# together are ingested one after another.
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 1

@@ -8,6 +8,8 @@ import pandas as pd
 import psycopg
 import streamlit as st
 
+from rag_lab.config import embed_family, embed_model_label
+
 STRATEGIES = ["hybrid", "hierarchical", "fixed", "recursive", "semantic"]
 
 
@@ -17,17 +19,16 @@ def frame(sql: str, params: tuple = ()) -> pd.DataFrame:
         return pd.DataFrame(cur.fetchall(), columns=[c.name for c in cur.description])
 
 
-def model_label(model: str) -> str:
-    """'qwen3-embedding:4b' -> '4b'."""
-    return model.split(":")[-1]
+model_label = embed_model_label  # 'qwen3-embedding:4b' -> '4b'; another family keeps its whole name
 
 
 def model_order(labels) -> list[str]:
-    """Models by size (0.6b, 4b, 8b)."""
+    """Models by size (0.6b, embeddinggemma-2:740m, 4b, 8b)."""
 
     def size(label: str) -> float:
+        tag = label.split(":")[-1].lower()
         try:
-            return float(label.rstrip("bB"))
+            return float(tag[:-1]) / (1000 if tag.endswith("m") else 1)
         except ValueError:
             return float("inf")
 
@@ -49,8 +50,15 @@ def _ollama_models() -> list[dict]:
 
 @st.cache_data(ttl=60)
 def embedding_models() -> list[str]:
-    """The Qwen3 embedding models Ollama has: the tokenizer used for chunk sizes is Qwen3's."""
-    return sorted(m["name"] for m in _ollama_models() if m["name"].startswith("qwen3-embedding"))
+    """The embedding models Ollama has that are of a known family (config.EMBED_FAMILIES), since a
+    model needs its family's tokenizer and prompt templates."""
+    return sorted(m["name"] for m in _ollama_models() if embed_family(m["name"]))
+
+
+@st.cache_data(ttl=60)
+def has_model(name: str) -> bool:
+    """Whether Ollama has this model (the OCR model, for example)."""
+    return any(m["name"] == name for m in _ollama_models())
 
 
 @st.cache_data(ttl=60)
@@ -65,11 +73,12 @@ def reranker_models() -> list[str]:
 
 
 @st.cache_data(ttl=60)
-def chat_models() -> dict[str, bool]:
-    """The models Ollama has that can chat with tools (the chatbot's model), each with whether it can
-    think. Rerankers are left out: they also report these capabilities but only answer yes or no."""
+def chat_models() -> dict[str, list[str]]:
+    """The models Ollama has that can chat with tools (the chatbot's model), each with its capabilities
+    (`thinking` and `vision` are what the page asks about). Rerankers are left out: they also report
+    these capabilities but only answer yes or no."""
     return {
-        m["name"]: "thinking" in m["capabilities"]
+        m["name"]: m["capabilities"]
         for m in _ollama_models()
         if {"completion", "tools"} <= set(m.get("capabilities", []))
         and "reranker" not in m["name"].lower()

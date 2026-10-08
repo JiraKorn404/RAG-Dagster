@@ -15,7 +15,10 @@ from rag_lab.paths import DATA_DIR
 
 
 def _key(cfg: EmbedConfig, text: str) -> str:
-    return hashlib.sha256(f"{cfg.model}|{cfg.dimension}|{text}".encode()).hexdigest()
+    # The text as it is sent, so a vector made with another document template is not reused. With
+    # Qwen3's template that is the text itself, which keeps the keys of the files already cached.
+    sent = cfg.document_template.format(text=text)
+    return hashlib.sha256(f"{cfg.model}|{cfg.dimension}|{sent}".encode()).hexdigest()
 
 
 def _path(root: Path, key: str) -> Path:

@@ -27,6 +27,9 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--model")
     parser.add_argument("--no-think", action="store_true", help="write the answer without thinking")
+    parser.add_argument(
+        "--no-pictures", action="store_true", help="give the model the caption of a picture only, not the image"
+    )
     parser.set_defaults(main=main)
 
 
@@ -35,6 +38,7 @@ def main(args) -> None:
         **({"top_k": args.top_k} if args.top_k else {}),
         **({"model": args.model} if args.model else {}),
         **({"think": False} if args.no_think else {}),
+        **({"show_pictures": False} if args.no_pictures else {}),
     }
     cfg = AgentConfig(**overrides)
 

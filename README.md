@@ -4,12 +4,12 @@ A RAG lab for PDF documents (text and tables). Upload a document, choose how it 
 
 - **Parsing:** Docling (read through LlamaIndex's `DoclingReader`)
 - **Chunking:** LlamaIndex splitters or our own (`hybrid`, `hierarchical`, `fixed`, `recursive`, `semantic`)
-- **Embedding and reranking:** Ollama (`qwen3-embedding`, `Qwen3-Reranker`)
+- **Embedding and reranking:** Ollama (`qwen3-embedding` or `embeddinggemma-2`, `Qwen3-Reranker`)
 - **Vector database:** Qdrant (dense vectors plus an optional BM25 sparse vector)
 - **Chatbot:** LangGraph and `langchain-ollama` with `gemma4:e4b-mlx`
 - **UI:** Streamlit. **Batch ingestion:** Dagster. **Metrics:** PostgreSQL
 
-Only PDFs with a text layer are supported. Images, figures and OCR are out of scope.
+A PDF with a text layer is read as it is. A scanned PDF can be read with OCR (`glm-ocr` on Ollama), and the pictures in a PDF can be indexed so that a question finds a figure (`embeddinggemma-2`); both are options on the Upload page.
 
 ## Architecture
 
@@ -39,8 +39,10 @@ Chatbot: question -> condense -> hybrid search + rerank -> grade -> answer with 
 
   ```
   ollama pull qwen3-embedding:0.6b                   # also :4b and :8b if you want to compare them
+  ollama pull embeddinggemma-2:740m                  # optional: a second embedding model family, and the one that can index pictures
   ollama pull dengcao/Qwen3-Reranker-4B:Q8_0         # the reranker (Q4_K_M also works)
   ollama pull gemma4:e4b-mlx                         # the chatbot's model
+  ollama pull glm-ocr:bf16                           # only for OCR of scanned PDFs
   ```
 
   The 0.6B reranker builds do not work: they give every chunk a score of 0.
@@ -59,15 +61,19 @@ The first start is slow: the code container takes about 50 s because it imports 
 | Page | What it does |
 |---|---|
 | **Experiments** | Lists every experiment with the PDFs in it. Delete a PDF from an experiment, or a whole experiment. |
-| **Upload** | Upload a PDF, pick a chunking strategy and its settings, see where the cuts fall in the document, and embed it into a new or existing experiment. Tick *Add a BM25 keyword vector* if you want hybrid search later; it cannot be added to an experiment afterwards. |
+| **Upload** | Upload a PDF, pick a chunking strategy and its settings, see where the cuts fall in the document, and embed it into a new or existing experiment. Tick *Add a BM25 keyword vector* if you want hybrid search later; it cannot be added to an experiment afterwards. Tick *Read scanned pages with OCR* for a PDF without a text layer: the regions that have no text are read by `glm-ocr`, and pages that have a text layer keep it. With `embeddinggemma-2` chosen, tick *Index the pictures* and each picture becomes a chunk embedded from the image and its caption; Try a query then shows it, and *Content: picture* searches the pictures only. |
 | **Try a query** | Pick an experiment and a search strategy (`dense`, `hybrid`, `dense+rerank`, `hybrid+rerank`), set top k, and see the chunks with their scores and timings. |
-| **Chatbot** | Ask questions of your documents or of your tables. A new chat starts with *Search in*: **Documents** (an experiment with a BM25 vector; the answer is written from the top chunks of a hybrid search with reranking, with `[n]` citations) or **Database** (a schema of imported tables; the model writes a SELECT, it is checked and run read-only, and the answer is written from the rows, with the SQL shown under it; click **Good answer** under one that is right and it is kept as an example the model is shown for similar questions later). The choice is fixed for the whole chat: to search somewhere else, start a new chat. The page shows what happens as it happens: each step, the model's thinking, the retrieved chunks and scores, how full the model's context is, and how long each step took. If the documents do not answer the question it retries once with a different query, and otherwise says so. |
+| **Chatbot** | Ask questions of your documents or of your tables. A new chat starts with *Search in*: **Documents** (an experiment with a BM25 vector; the answer is written from the top chunks of a hybrid search with reranking, with `[n]` citations) or **Database** (a schema of imported tables; the model writes a SELECT, it is checked and run read-only, and the answer is written from the rows, with the SQL shown under it; click **Good answer** under one that is right and it is kept as an example the model is shown for similar questions later). The choice is fixed for the whole chat: to search somewhere else, start a new chat. The page shows what happens as it happens: each step, the model's thinking, the retrieved chunks and scores, how full the model's context is, and how long each step took. If the documents do not answer the question it retries once with a different query, and otherwise says so. When a retrieved chunk is a picture (an experiment made with *Index the pictures*), the model is shown the picture itself and can answer from what is in it; *Show pictures to the model* turns that off. |
 | **Database** | Import CSV files into a schema of the database for imported tables (UTF-8, first row the header, up to 50 MB and 1,000,000 rows each). Each file shows a preview and the column types it guessed, which you can change, and a table name. A bad row stops the import and leaves nothing behind. Below, what each table holds (with descriptions you can write), what the model is given about the schema, the good answers saved for it (turn one off or delete it), and deletes for a table or a schema. |
 | **Benchmark** | Runs one document through every chosen embedding model, chunking strategy and search strategy, and saves a report with a PDF download. |
 
 ## Batch ingestion with Dagster
 
-Drop PDFs in `data/raw/`. A sensor registers each as a Dagster partition (its id is the first 16 hex characters of the file's SHA-256). Launch `ingest_job` for a partition in the Dagster UI (http://localhost:3000) with the experiment set in the run config under `resources.experiment.config`; it runs parse, chunk, embed and index. See `CLAUDE.md` for the config keys.
+Put a PDF in `data/raw/`. Within about a minute a sensor starts `ingest_job` for it, which runs parse, chunk, embed and index into the experiment written in `config/ingest.yaml`; watch it in the Dagster UI (http://localhost:3000). PDFs that arrive together are ingested one after another.
+
+`config/ingest.yaml` is one experiment: its name (also the Qdrant collection), and the parse, chunk, embed and index settings. A key left out keeps its default and an unknown key is an error, shown on the sensor in the Dagster UI. The file is read each time a new PDF arrives, so an edit needs no restart. Settings cannot change under the same name: to change one, change `name` too, and the PDFs that arrive from then on go into the new experiment.
+
+Only a PDF that is new starts a run (its id is the first 16 hex characters of the file's SHA-256, so a renamed copy is not new). For a PDF that was already in the folder, or one whose run failed, launch `ingest_job` for its partition in the Dagster UI with the experiment set in the run config under `resources.experiment.config`, or use *Re-execute* on the failed run. See `CLAUDE.md` for the config keys.
 
 ## Command line
 

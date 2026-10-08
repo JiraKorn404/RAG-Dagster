@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import data
+import hits
 import preview
 import streamlit as st
 import style
@@ -25,8 +26,10 @@ from rag_lab.config import (
     ExperimentConfig,
     HybridSettings,
     IndexConfig,
+    ParseConfig,
     RecursiveSettings,
     SemanticSettings,
+    embed_family,
 )
 from rag_lab.embedding.ollama import OllamaEmbedder
 from rag_lab.ingest import (
@@ -39,11 +42,11 @@ from rag_lab.ingest import (
     save_upload,
 )
 from rag_lab.metrics.store import MetricsStore
+from rag_lab.parsing.pictures import save_pictures
 from rag_lab.storage.qdrant import QdrantStore
 
 PAGE_SIZE = 100
 STRATEGIES = ["hybrid", "hierarchical", "fixed", "recursive", "semantic"]
-DIMENSIONS = ["native", 256, 512, 768, 1024]
 
 
 @st.cache_resource
@@ -55,26 +58,50 @@ def services() -> tuple[OllamaEmbedder, QdrantStore, MetricsStore]:
     )
 
 
-def register_upload(name: str, content: bytes) -> dict:
-    """Save an upload and parse it once (cached on disk by document id)."""
-    doc_id, path = save_upload(name, content)
-    with st.status("Parsing with Docling (20 to 30 s on CPU, once per document; cached afterwards)…") as status:
-        parse_dir, meta = ensure_parsed(path, doc_id)
+def parse_upload(name: str, doc_id: str, path: Path, ocr: bool) -> dict:
+    """Parse a saved upload once, with or without OCR (each cached on disk by document id)."""
+    label = "Parsing with Docling (20 to 30 s on CPU, once per document; cached afterwards)…"
+    if ocr:
+        label = "Parsing with Docling, then reading the regions that have no text with OCR (once per document; cached afterwards)…"
+    with st.status(label) as status:
+        try:
+            parse_dir, meta = ensure_parsed(
+                path,
+                doc_id,
+                ocr,
+                os.environ["OLLAMA_BASE_URL"],
+                lambda done, total: status.update(label=f"OCR: page {done} of the {total} that need it…"),
+            )
+        except Exception as e:  # noqa: BLE001  (Docling failed, or the OCR model could not be reached)
+            status.update(label="Parsing failed", state="error")
+            st.error(f"Parsing failed: {e}")
+            st.stop()
         status.update(label="Parsed", state="complete")
-    return {"doc_id": doc_id, "name": name, "dir": str(parse_dir), "meta": meta}
+    return {"doc_id": doc_id, "name": name, "path": str(path), "ocr": ocr, "dir": str(parse_dir), "meta": meta}
 
 
 style.hero("Upload", "Upload a document, choose how it is chunked, embed it, then search it")
 
 upload = st.file_uploader("PDF document", type=["pdf"])
-if upload is not None:
-    content = upload.getvalue()
-    doc = st.session_state.get("up_doc")
-    if doc is None or doc["doc_id"] != hashlib.sha256(content).hexdigest()[:16]:
-        st.session_state.pop("up_chunks", None)
-        st.session_state["up_doc"] = register_upload(upload.name, content)
-
+ocr_model = ParseConfig().ocr_model
+ocr_ready = data.has_model(ocr_model)
+ocr = st.checkbox(
+    "Read scanned pages with OCR (glm-ocr)",
+    value=False,
+    disabled=not ocr_ready,
+    help="Regions with no text layer are cropped from the page image and read by "
+    f"`{ocr_model}` on Ollama. A page that has a text layer keeps it. Takes about 15 to 20 s for a scanned page."
+    + ("" if ocr_ready else f" Not available: Ollama does not list `{ocr_model}`."),
+)
 doc = st.session_state.get("up_doc")
+if upload is not None and (doc is None or doc["doc_id"] != hashlib.sha256(upload.getvalue()).hexdigest()[:16]):
+    st.session_state.pop("up_chunks", None)
+    doc_id, path = save_upload(upload.name, upload.getvalue())
+    doc = st.session_state["up_doc"] = parse_upload(upload.name, doc_id, path, ocr)
+elif doc is not None and doc["ocr"] != ocr:
+    st.session_state.pop("up_chunks", None)
+    doc = st.session_state["up_doc"] = parse_upload(doc["name"], doc["doc_id"], Path(doc["path"]), ocr)
+
 if doc is None:
     st.info("Upload a PDF to start. It is parsed once with Docling's default settings; changing the chunk settings never parses again.")
     st.stop()
@@ -91,8 +118,17 @@ for col, (label, value, sub) in zip(
     ],
 ):
     col.markdown(style.card(label, value, sub), unsafe_allow_html=True)
+if doc["ocr"]:
+    cut = meta["ocr_cut_regions"]
+    st.caption(
+        f"OCR read {meta['ocr_regions']} regions on {meta['ocr_pages']} pages in {meta['ocr_seconds']:.0f} s"
+        + (f"; {cut} of them reached the token limit and may be incomplete." if cut else ".")
+    )
 if meta["chars_per_page"] < SCANNED_PDF_CHARS_PER_PAGE:
-    st.warning("Very little text per page: this looks like a scanned PDF. OCR is off, so there is little to chunk.")
+    if doc["ocr"]:
+        st.warning("Very little text per page, even with OCR: there is little to chunk.")
+    else:
+        st.warning("Very little text per page: this looks like a scanned PDF. Tick the OCR box above to read it.")
 st.write("")
 
 # --- chunk settings ----------------------------------------------------------------------------
@@ -100,11 +136,13 @@ style.section("Chunking", "The same settings the chunk stage takes. Only the one
 models = data.embedding_models()
 default_model = EmbedConfig().model
 if not models:
-    st.warning("Ollama did not list any qwen3-embedding model; using the default. Chunking `semantic` and embedding need Ollama.")
+    st.warning("Ollama did not list any embedding model this lab knows; using the default. Chunking `semantic` and embedding need Ollama.")
     models = [default_model]
 c1, c2, c3 = st.columns([2, 1, 2])
 model = c1.selectbox("Embedding model", models, index=models.index(default_model) if default_model in models else 0)
-dimension_choice = c2.selectbox("Vector size", DIMENSIONS)
+# the sizes this model's vectors can be cut to; the key makes a new choice when the family changes
+sizes = embed_family(model).dimensions
+dimension_choice = c2.selectbox("Vector size", ["native", *sizes], key=f"dimension-{sizes}")
 engine = c3.radio("Chunk engine", ["llamaindex", "native"], horizontal=True)
 
 c1, c2, c3 = st.columns([2, 1, 2])
@@ -117,6 +155,14 @@ sparse = st.checkbox(
     value=IndexConfig().sparse,
     help="Keyword search over the same chunks, stored next to the embedding. Costs a little extra index time. It cannot be added to an experiment later.",
 )
+takes_images = embed_family(model).images
+pictures = st.checkbox(
+    "Index the pictures (needs a multimodal embedding model)",
+    value=False,
+    disabled=not takes_images,
+    help="Each picture in the document becomes a chunk of its own, embedded from the image together with "
+    "its caption, so a question can find a figure. Only `embeddinggemma-2` takes images.",
+) and takes_images  # a box ticked before the model was changed does not count
 
 overlap, merge_peers = 0, HybridSettings().merge_peers
 separators = RecursiveSettings().separators
@@ -156,7 +202,8 @@ def build_config(name: str, tag: str | None = None) -> ExperimentConfig:
     return ExperimentConfig(
         name=name,
         tag=tag,
-        embed=EmbedConfig(model=model, dimension=None if dimension_choice == "native" else int(dimension_choice)),
+        parse=ParseConfig(ocr=doc["ocr"], pictures=pictures),
+        embed=EmbedConfig.for_model(model, dimension=None if dimension_choice == "native" else int(dimension_choice)),
         chunk=ChunkConfig(
             engine=engine,
             strategy=strategy,
@@ -183,6 +230,8 @@ if st.button("Chunk", type="primary"):
     try:
         with st.spinner("Chunking…"):
             document = DoclingDocument.load_from_json(Path(doc["dir"]) / f"{doc['doc_id']}.json")
+            if config.parse.pictures:  # the picture files, next to the cached parse
+                save_pictures(Path(doc["path"]), document, Path(doc["dir"]), doc["doc_id"], config.parse)
             started = time.perf_counter()
             chunks, ctx = chunk_document(document, doc["doc_id"], config, embedder)
             seconds = time.perf_counter() - started
@@ -252,7 +301,8 @@ with tab_doc:
     st.markdown(preview.document_html(text, chunks, lo, hi), unsafe_allow_html=True)
 with tab_embedded:
     st.caption("What is embedded and stored: the chunk text, with the headings added in front when that is switched on.")
-    st.markdown(preview.embedded_html(chunks[first:last], first), unsafe_allow_html=True)
+    picture = lambda chunk: hits.picture_html(Path(doc["dir"]) / chunk.image)  # noqa: E731
+    st.markdown(preview.embedded_html(chunks[first:last], first, picture), unsafe_allow_html=True)
 
 # --- embed -------------------------------------------------------------------------------------
 st.write("")

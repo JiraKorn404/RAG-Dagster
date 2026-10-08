@@ -1,6 +1,6 @@
 # Plan
 
-Phase 14 and the RAG chatbot (Phases 15 to 18) are built and wait for a look at the Chatbot page in a browser before they move to `COMPLETED_PLAN.md`. Chat history and chat metrics (Phases 19 and 20) are built too, with the same by-eye check open. Text-to-SQL over imported CSV files is built through Phase 27 (the by-eye checks of its pages are still open) and its evaluation, Phase 28, is planned. Options for putting the config in YAML are listed below, waiting for a decision. Phases 0 to 13 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that compares embedding models, chunking strategies and search strategies (dense, hybrid, reranked) and produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
+Phase 14 and the RAG chatbot (Phases 15 to 18) are built and wait for a look at the Chatbot page in a browser before they move to `COMPLETED_PLAN.md`. Chat history and chat metrics (Phases 19 and 20) are built too, with the same by-eye check open. Text-to-SQL over imported CSV files is built through Phase 27 (the by-eye checks of its pages are still open) and its evaluation, Phase 28, is planned. OCR (`glm-ocr`) with an option on the Upload page is built (Phase 29; the by-eye check of the page is open), `embeddinggemma-2` is a second embedding model for text (Phase 30), pictures are chunks embedded from the image (Phase 31), and the chatbot's model is shown the pictures it retrieves (Phase 32); the by-eye checks of these pages are open. Automatic ingestion is built (Phase 33): a PDF put into `data/raw` starts the Dagster pipeline with the settings of `config/ingest.yaml`. Options for putting the config in YAML are listed below, waiting for a decision. Phases 0 to 13 are done: the project is a RAG platform with an Upload page (chunk preview, embed into a new or existing experiment), a Try a query page, an Experiments page (list and delete what is in each experiment) and a Benchmark page that compares embedding models, chunking strategies and search strategies (dense, hybrid, reranked) and produces a PDF report. What each phase planned and found is in `COMPLETED_PLAN.md`; the current state of the repo is in `CLAUDE.md`.
 
 A new phase is written here as `## Phase 14 — ...`: a goal, a table of decisions, numbered steps with checkboxes, and a "Done when" line that is checked once on the real stack. When it is done, its section moves to `COMPLETED_PLAN.md`.
 
@@ -787,6 +787,397 @@ Steps:
 - **The whole schema in the prompt** does not scale: a few tables are fine, dozens are not. The budget check turns that into a clear message, and retrieval (Ideas) is the way out.
 - **Examples can mislead.** A wrong thumbs-up, or an example that looks similar but needs different SQL, can pull the model the wrong way. The *Examples* tab shows what it was given, and the evaluation measures the effect.
 
+## OCR and multimodal embedding (Phases 29 to 32)
+
+**Goal:** a scanned PDF can be ingested, by ticking an OCR option on the Upload page, and the pictures in a PDF can be found by a text query. OCR is `glm-ocr:bf16`; the multimodal embedding model is `embeddinggemma-2:740m` (768 dimensions, text and images in one vector space). Both run on the Ollama at `OLLAMA_BASE_URL`.
+
+Four parts, each usable on its own: 29 OCR and its checkbox, 30 EmbeddingGemma 2 as a second embedding model for text, 31 pictures as chunks embedded from the image, 32 the chatbot looks at the pictures it retrieved. 29 does not depend on the others; 31 needs 30 and 32 needs 31.
+
+### What changes in scope
+
+OCR and pictures come into scope, both off by default, so an experiment made without them is what it is today. Still out: audio and video (the embedding model takes them, nothing here uses them), handwriting as a goal, and file types other than PDF and CSV. `CLAUDE.md`'s Scope section and the "OCR and picture features stay off" lines change as each part lands.
+
+### What was checked while drafting
+
+On the real Ollama (0.40.0, the Mac), with the FAA chapter already in `data/uploads/` (23 pages, a text layer, so its own text is the ground truth).
+
+**`glm-ocr:bf16`** (1.1B, capabilities `completion, vision, tools`):
+
+| Tried | Result |
+|---|---|
+| A whole page, `Text Recognition:`, straight to Ollama | Fails: `prediction aborted, token repeat limit reached`, on both pages tried. |
+| A whole page through Docling's own `VlmPipeline` (the `GLMOCR_VLLM_API` preset pointed at Ollama) | 57 to 59 s a page, `partial_success`. Page 1 gave 1,556 characters of about 4,000, repeated inside a code block; the table on page 14 came out as a list; no headings; every box is `[0, 0, 0, 0]`. Not usable. |
+| One region cropped from the page (a paragraph, a heading), `Text Recognition:` | Reads it correctly: the start of the output matched the text layer in every sample looked at. A 1095 x 154 px crop is 250 prompt tokens. |
+| The table on page 14 cropped, `Table Recognition:` | A correct HTML `<table>` with `colspan` rows. Docling's own TableFormer gave this table 0 rows and 0 columns in the text-layer parse, so here the OCR model is the better table reader. |
+| A photo cropped, `Figure Recognition:` and `Text Recognition:` | The first echoes the prompt, the second returns nothing (there is no text in it). The model does not describe pictures. |
+| Stopping | **It never stops by itself in this build.** Every call ran to `num_predict` (2,048 tokens in 17.4 s, so 117 tokens per second): the text, then `` ```markdown `` and the text again, on `/api/chat`, `/api/generate`, raw with GLM's own prompt format, and with a repeat penalty. Token probabilities show why: after the text, a newline is preferred (-0.04) to the end token (-3.2). With `stop` strings the call ended after 7 tokens with exactly `Introduction`. |
+
+So: the model is used **per region, not per page**, the layout comes from Docling, and every call needs a stop rule and a token cap. Without the stop rule a page of 19 regions took 338 s; with it the same page should be 15 to 30 s (to be measured in Phase 29).
+
+**`embeddinggemma-2:740m`** (capabilities `embedding, vision, audio`):
+
+| Tried | Result |
+|---|---|
+| Size | 768 dimensions, unit length (`/api/show` reports 512, which is wrong; the code already reads the size from the vectors). `dimensions: 256` works; the model card supports 768, 512, 256 and 128. Context 8,192 tokens. |
+| An image | `/api/embed` with `"input": [{"image": "<base64>"}]`. Strings and image objects can be mixed in one batch. `{"text": ..., "image": ...}` gives one vector for both. About 0.45 s an image when warm; an image costs 260 prompt tokens. |
+| **The trap** | A top-level `"images": [...]` field, as the chat API has, is accepted and **silently ignored**: the vector equals the text-only one (cosine 1.000). The embedder must use the object form, and the phase checks that an image changes the vector. |
+| Does it line up text and images | A red square image scored 0.711 against "a red square" and 0.624 against "a blue square"; the blue image 0.645 and 0.714. Right way round, small margin. |
+| The modality gap | Text against text scores much higher than text against an image: "a red square" and "a blue square" are 0.917 alike, more than either is to its own picture. In one ranked list pictures will sit below text. |
+| Prompts (model card) | Not Qwen3's. A query is `task: search result \| query: {text}`, a document `title: none \| text: {text}`; an image gets no prefix. Ollama's template is bare, so we add them. |
+| Tokenizer | `google/embeddinggemma-2` on Hugging Face, not gated (the `-740m` name and the old `-300m` are). |
+
+### Architecture
+
+```
+upload ->  parse (Docling: layout, tables, text layer)
+             |- OCR on:      regions with no text  -> crop from the page image -> glm-ocr -> text / table      (Phase 29)
+             |- pictures on: each picture          -> <doc_id>.pictures/<n>.png                                (Phase 31)
+        -> chunk     text and table chunks as today; one chunk per picture (modality `picture`, its caption as text)
+        -> embed     text: the model's document prompt (Qwen3 or EmbeddingGemma 2)                             (Phase 30)
+                     picture: the image, with its caption, as one input (EmbeddingGemma 2 only)                (Phase 31)
+        -> index     one collection per experiment, as today; a picture is a point with `modality = picture`
+        -> search    a text query; pictures come back as hits and are drawn on the hit card
+```
+
+Everything after parsing sees an ordinary Docling document, so the five chunking strategies, BM25, the rerankers and the benchmark do not change for OCR. New code: `parsing/ocr.py` (the region loop and the Ollama call), `chunking/pictures.py` (picture chunks, added after any strategy), and image inputs in `embedding/ollama.py`. No new dependency: `pypdfium2`, Pillow and `httpx` are in the image. Docling's own OCR engines stay off (`do_ocr=False`), so there is one OCR path.
+
+### Phase 29 — OCR with glm-ocr, and the Upload checkbox
+
+**Goal:** a PDF with no text layer, uploaded with OCR ticked, becomes the same kind of parsed document as a PDF with one (headings, paragraphs and tables with their pages and boxes), and is chunked, embedded and searched like any other.
+
+| Decision | Choice |
+|---|---|
+| Where the regions come from | Docling's standard pipeline as today (`do_ocr=False`), with the layout option `keep_empty_clusters` and `generate_page_images`. The layout model works on the page image, so a scanned page still gets its regions, with boxes and labels, but empty text. |
+| What OCR fills | Every text-like item with no text and every table with no cells, cropped from the page image at `ocr_scale`. Label decides the prompt: `Text Recognition:`, `Table Recognition:` for a table, `Formula Recognition:` for a formula. Pictures are left alone (Phase 31). |
+| What "OCR on" means | **OCR where there is no text layer.** A page that has one keeps it; a scanned page inside an otherwise normal PDF is read. Ignoring a text layer that exists (a broken one) is under Ideas. |
+| The call | `POST /api/chat` with the crop as the message's image, temperature 0, `stop` strings and `num_predict = ocr_max_tokens`. The stop rule is settled in step 1 on a whole page; a region that still hits the cap is counted and reported, not hidden. |
+| Tables | The returned HTML table becomes Docling `TableData`, so a table chunk is serialised as it is today. Docling's own HTML table reader is used if it can be called on a fragment; otherwise a small one of ours (`html.parser`, `colspan` and `rowspan`). |
+| Config | `ParseConfig` gains `ocr: bool = False`, `ocr_model = "glm-ocr:bf16"`, `ocr_scale = 2.0`, `ocr_max_tokens`, `ocr_keep_alive`. All left out of the config hash while `ocr` is false, so every existing hash is unchanged. |
+| Who calls Ollama | `parse_pdf` takes the Ollama address when `cfg.ocr`; without it, parsing needs no Ollama, as now. The `parsed_document` asset passes the Ollama resource. |
+| Upload page | A checkbox above the uploader's result, "Read scanned pages with OCR (glm-ocr)", off by default; disabled with a reason when Ollama does not list the model. The parse cache gets a second variant, `data/artifacts/_uploads/<doc_id>/ocr/`, so ticking and unticking does not parse twice. The experiment is built with `parse=ParseConfig(ocr=True)`, so it is recorded and "an existing experiment with the same settings" offers only OCR experiments. The scanned-PDF warning now says to tick the box. Progress is shown per page. |
+| Metrics | The parse meta and the `parse` stage row gain `ocr_regions`, `ocr_seconds`, `ocr_output_tokens`, `ocr_cut_regions` (hit the cap) and `ocr_pages`. `chars_per_page` counts the OCR text. |
+| Tests | Config hashing gets the new fields (a tested area). **For you to approve:** a few pure-logic tests for the HTML table to `TableData` step if we write our own, since a silent bug there corrupts table content. Nothing else. |
+
+Steps:
+
+- [x] 1. Settle the stop rule: OCR every region of page 1 and the table of page 14 of the FAA chapter with stop strings and a cap; all regions must end by `stop`. If some do not, try in order: cutting the output where it starts to repeat, the `glm-ocr:q8_0` or `latest` tag, a newer Ollama. Record the seconds per page here.
+- [x] 2. Check that `keep_empty_clusters` gives items with boxes and empty text on an image-only PDF (the FAA chapter rasterised with pypdfium2 and Pillow). If it does not, the fallback is a Docling OCR engine of our own in its `layout_regions` mode.
+- [x] 3. `ParseConfig` fields and the hash rule; `parsing/ocr.py` (crop, call, clean, fill, table); `parse_pdf` and `build_converter` use it when `cfg.ocr`.
+- [x] 4. `ingest.ensure_parsed(path, doc_id, parse_cfg)` with the cache variant; `record_parse` details; the `parsed_document` asset.
+- [x] 5. `ui/upload.py`: the checkbox, the per-page status, the warning text, `parse=` in `build_config`.
+- [x] 6. `CLAUDE.md` (Scope, the parse facts, the Upload description) and README.
+
+**Done when:** the FAA chapter rasterised into an image-only PDF (so `chars_per_page` is near 0 without OCR) is uploaded with the box ticked, and (a) its OCR text is compared with the original's text layer page by page, with the character similarity and the seconds per page recorded here; (b) the page 14 table is a table chunk with its rows; (c) an experiment made from it answers "what to do when a door opens in flight" on Try a query from the same passage the text-layer experiment does. The same PDF without the box still shows the scanned warning. Checked once.
+
+Built differently from the draft:
+
+- **No stop string works for text, so the reply is read as a stream and cut by a rule of ours.** A `` ``` `` stop ended only 6 of 19 regions on page 1: a paragraph is followed by a newline and the same paragraph again, with no fence. Stopping at the first newline ended all of them but lost the second line of a two-line heading. So `first_reading` reads the lines as they arrive and the connection is closed (which stops the generation) at the first line that is a code fence, starts like the first line, has Chinese characters when the first line has none, has no letter or digit, or was seen before. The last three came from the first full run, which was killed after it spent minutes on page 1: two regions were followed by `境` on every line up to the token limit, and three regions kept a junk line such as `醒 读：`. A `stop` string is used only for tables (`</table>`). The other tags and a newer Ollama were not needed.
+- The crop has 1 point of padding. The 6 points of the drafting checks read the neighbouring paragraphs' lines into a region, which looked like an OCR error and was not.
+- A region is one piece of running text: its lines are joined with a space, as Docling joins a paragraph's lines. Code and formulas keep their lines and use only the first two end rules. A list item's leading `-` is dropped, because Docling writes the marker itself.
+- The HTML table goes through `docling.utils.deepseekocr_utils._parse_table_html`. It does exactly this on a fragment, so there is no reader of ours and no tests for one; it is a private function of Docling, which an upgrade could move.
+- `ensure_parsed` takes `ocr: bool`, not a whole `ParseConfig`: the Upload page parses with the defaults either way.
+- A table is read when none of its cells has text, not only when it has no cells, so a table that TableFormer left empty on a text-layer page is read too.
+- A text region where nothing is read is removed from the document. `OcrStats` also counts these (`empty_regions`).
+- `ocr_max_tokens` is 4096 (the 25-row table took 688 tokens). There is also a retry of a failed connection, three times, as the embedder has.
+- `Formula Recognition:` is wired for formula regions but was not run on a real formula: the test document has none.
+
+**Result (checked on the real stack; the scan is the FAA chapter rendered at 144 dpi into an image-only PDF, 23 pages, 6.4 MB):**
+
+- Layout on a scan: with `keep_empty_clusters` Docling gave 252 text regions with boxes and no text (section headers, paragraphs, list items, captions), 2 tables and 13 pictures; without it, no text items at all. The text-layer parse of the original has 240 text items, so the regions are close to the real ones.
+- (a) Against the original's text layer: 0.998 of its words are found again in the OCR text, page by page (the lowest page 0.991). Character similarity is 0.978 to 1.000 on 21 pages. Pages 14 and 16 score 0.81 and 0.40 only because the OCR text has more than the reference: those are the two tables, which the text-layer parse left empty and the OCR read (24 rows and 17 rows, 3 columns each).
+- Time: layout 135 s and OCR 284 s in the first measured run, so about 6 s and 12 s a page, 18 s together; no region reached the token limit. Through the Upload page the whole parse took 384 s (241 s of it OCR, 254 regions, 17,922 output tokens).
+- (b) The page 14 table is a table chunk (489 tokens, its rows as a Markdown table under its caption); the page 16 table is two.
+- (c) "what to do when a door opens in flight" returns the same three passages from the same pages as the text-layer experiment `full-ingest-dense-sparse`, with "Door Opening In-Flight" (page 17) first at 0.763 against 0.768.
+- The Upload page through the app tester: without the box the scan shows "this looks like a scanned PDF. Tick the OCR box above to read it."; ticking it parses with OCR and shows "OCR read 254 regions on 23 pages in 241 s."; Chunk gave 51 chunks (48 text, 3 table); Embed and index wrote the experiment `up-afh-ch18-scanned-ocr`, whose stored settings have `parse.ocr` and whose `parse` stage row has the OCR numbers. A second session with the box ticked before the upload took the parse from the cache (25 s). The parse file is 423 kB: the page images are not kept.
+- The 44 tests pass (the 43 and one for the hash: the `ocr*` settings change it only when `ocr` is on).
+- What is left over: a full-width bracket or a Chinese `一` for a dash inside English text, in 2 of 254 regions. Only English, and only a clean render, were looked at: a real scan (skewed, noisy) will be worse.
+- Not seen by eye: the checkbox and the per-page status in a browser. The app tester ends the embed step with a page-link error that only exists in the tester (it runs `upload.py` without the navigation); the embed itself had finished.
+- Kept for you to look at: the experiment `up-afh-ch18-scanned-ocr` and its upload `afh_ch18_scanned.pdf`. Delete the experiment on the Experiments page if you do not want it.
+
+### Phase 30 — EmbeddingGemma 2 as an embedding model (text)
+
+**Goal:** an experiment can be embedded with `embeddinggemma-2:740m` and used on Upload, Try a query, the Chatbot and the Benchmark, text and tables only.
+
+| Decision | Choice |
+|---|---|
+| Prompts | `EmbedConfig` gains `query_template` (default Qwen3's `Instruct: {instruction}\nQuery: {text}`) and `document_template` (default `{text}`). `OllamaEmbedder.embed` formats with them instead of the hard-coded Qwen3 prefix. Both are left out of the hash while they are the defaults. |
+| Model families | One small table in `config.py`, keyed by the start of the model name: tokenizer, the two templates, native size, the sizes it can be cut to, whether it takes images. `EmbedConfig.for_model(name)` fills a config from it; the pages call that. The experiment still records every value, so the table is only a source of defaults. |
+| EmbeddingGemma 2's row | tokenizer `google/embeddinggemma-2`; query `task: search result \| query: {text}`; document `title: none \| text: {text}` (headings stay inside the chunk text, as for Qwen3); native 768; sizes 768, 512, 256, 128; images yes. |
+| Vector size | Still our own truncation and re-normalisation, one path for every model. Ollama's `dimensions` option is not used. |
+| The pages | `data.embedding_models()` lists the installed models whose family is in the table (today it is `startswith("qwen3-embedding")`). The Upload page's *Vector size* list follows the chosen model. `model_label` shows the family when it is not Qwen3, so `740m` is not read as a Qwen3 size. |
+| Semantic chunking | It embeds sentences in document mode, so it follows the templates; the embedding cache key must include the document template (to check in `embedding/cache.py`). |
+| Left alone | The good-answers index of text-to-SQL keeps its own `EmbedConfig` (Qwen3). Existing experiments are not re-embedded. |
+| Tests | Config hashing: a fixed list of today's configs keeps its hashes; a config with the new templates gets a different one. |
+
+Steps:
+
+- [x] 1. The templates in `EmbedConfig`, the hash rule, the family table and `for_model`; `OllamaEmbedder.embed` uses the templates.
+- [x] 2. `ui/data.py`, `ui/upload.py`, `ui/benchmark.py`, the model labels in `ui/data.py` and `benchmark/report.py`.
+- [x] 3. Check on one long chunk that Ollama's `prompt_eval_count` is our token count plus the prefix, so nothing is cut short of `max_tokens`.
+- [x] 4. The hashing tests; `CLAUDE.md` (the "Key technical facts" that say Qwen3 only).
+
+**Done when:** the FAA chapter is embedded into a new experiment with `embeddinggemma-2:740m` (768, BM25 on); the door question returns the "Door Opening In-Flight" chunk first on Try a query and is answered in the Chatbot; and one benchmark report with `qwen3-embedding:0.6b` and `embeddinggemma-2:740m` on that document finishes. The hashing tests pass. Checked once.
+
+Built differently from the draft:
+
+- The family table has no native size and no "takes images" flag. The native size differs inside the Qwen3 family (1024, 2560, 4096) and the code already reads the size from the vectors; the images flag comes with Phase 31, which is the first thing to need it.
+- A label is the size for a Qwen3 model (`4b`, as before) and the whole name for any other (`embeddinggemma-2:740m`), in one function, `config.embed_model_label`, that the pages and the report both use. A benchmark experiment of another family is named with it (`bench-<doc>-<id>-embeddinggemma-2-740m-<strategy>`). The charts order models by size, reading `740m` as 0.74.
+- The embedding cache key is the text as it is sent (the document template applied), not the template as a separate part. With Qwen3's template that is the text itself, so every file already cached keeps its key.
+- `ui/benchmark.py` needed no change: the runner builds the config with `for_model`.
+- The hash test pins four hashes computed with the config module as committed before Phases 29 and 30, so it also guards the OCR settings.
+- `EmbedConfig(model=...)` alone still means Qwen3's tokenizer and templates. A Dagster run config for an EmbeddingGemma 2 experiment therefore has to set `embed.tokenizer` and both templates; the pages and the benchmark do it through `for_model`.
+
+**Result (checked on the real stack):**
+
+- Token counts: for chunks of 128, 512, 2,000 and 6,000 tokens Ollama counted our count of the sent text plus 2 for EmbeddingGemma 2 (the document prefix adds 6 tokens to a chunk) and our count plus 1 for Qwen3 (512 to 6,000). Nothing is cut short. Vectors are 768 wide.
+- The Upload page through the app tester: the model list is `embeddinggemma-2:740m` and the three Qwen3 models, with `qwen3-embedding:0.6b` still the default; *Vector size* offers native, 256, 512, 768, 1024 for Qwen3 and native, 128, 256, 512, 768 for EmbeddingGemma 2; with BM25 ticked the FAA chapter was chunked (51 chunks, counted with the new tokenizer) and embedded into `up-afh-ch18-gemma2` (51 points, 3,359 tokens per second).
+- "what to do when a door opens in flight" on that experiment returns "Door Opening In-Flight" (page 17) first at 0.839, then Cabin Fire 0.729 and In-Flight Fire 0.720. The scale is the model's own: the same question scores 0.768 with Qwen3.
+- The chatbot agent (`python -m rag_lab.agent documents`, the code the Chatbot page calls) answered the door question from that chunk, citing `[1]`, in 43 s (retrieve 20 s, generate 23 s with a cold model).
+- A benchmark report (`34e8ff`: two models, `hybrid` and `recursive` chunking, `dense` and `hybrid` search, 7 test queries) finished in 142 s with all four experiments done, and its report and PDF build with both labels. Embedding speed 13.3 and 13.6 chunks per second for EmbeddingGemma 2 against 7.4 and 7.9 for `qwen3-embedding:0.6b`. Dense MRR 0.89 and 0.87 against 0.86 and 0.86; hybrid MRR 0.90 against 0.93; recall@5 is 1.0 everywhere except one EmbeddingGemma 2 dense run (0.86). Seven queries on one document cannot rank the two; what it shows is that the prompts and the tokenizer are right.
+- The 46 tests pass (two new ones for the hash).
+- Not seen by eye: the model list and the size list in a browser, and the Chatbot page itself (the agent was run from the command line).
+- Kept for you to look at: the experiment `up-afh-ch18-gemma2` and the report `34e8ff` with its four `bench-19_afh_ch18-34e8ff-...` experiments. The Experiments and Benchmark pages delete them.
+
+### Phase 31 — Pictures as chunks, embedded from the image
+
+**Goal:** a figure in a PDF is a point in the experiment's collection, embedded from its image, and a text query finds it.
+
+| Decision | Choice |
+|---|---|
+| Parse | `ParseConfig.pictures: bool = False` switches on Docling's `generate_picture_images`; each picture is written to `<doc_id>.pictures/<n>.png` beside the parse files (also in the `_uploads` cache). Pictures whose shorter side is under `picture_min_side` pixels (rules, logos, icons) are dropped. Left out of the hash while false. |
+| Chunk | A picture chunk has `modality = "picture"`, `image` (the file, relative to the parse folder), page, box, headings, and as `text` its caption, or "Figure on page N" when it has none, so the text is never empty. `chunking/pictures.py` adds them after any strategy, so the five strategies do not change. They have no source text, so their span is empty. |
+| What is embedded | `EmbedConfig.picture_input`: `image+caption` (the default: one input with both), `image`, or `caption` (text only, which also works with Qwen3 and is the baseline that says whether the image adds anything). Left out of the hash unless the experiment has pictures on. |
+| Request | `{"image": "<base64>"}` or `{"text": ..., "image": ...}` inside `input`, never the top-level `images` field. The embedder refuses images for a family the table says cannot take them, before any call. |
+| Config check | `pictures` with `picture_input` other than `caption` needs a model that takes images; an invalid combination fails when the config is built, with a message naming the two settings. |
+| Index | The same collection and the same unnamed vector. The payload gains `image`. `modality` already has a payload index. BM25, when on, is made from the caption. |
+| Search | Nothing new in `search()`. *Content* on Try a query gains `picture`. Because of the modality gap pictures will rank under text in a mixed list; this phase measures by how much and does not correct it (a reserved number of picture hits is under Ideas). |
+| Rerank | The reranker reads text, so it judges a picture by its caption. Known limit: a picture whose caption does not say what it shows is dropped by the `+rerank` methods. |
+| Showing a hit | `Hit` gains `image`; `ui/hits.py` draws the picture on the card (Try a query and the Chatbot's chunk cards). The Upload preview lists picture chunks with their thumbnails. |
+| Chatbot | A picture hit reaches the answer model as its caption, page and headings, like any chunk, and can be cited. The image itself is Phase 32. |
+| Delete | `library.py` removes a document's `.pictures` folder with its parse files. |
+| Benchmark | Unchanged and text only: test queries are judged by a snippet of text, which a picture does not have. |
+| Upload page | A checkbox "Index the pictures (needs a multimodal embedding model)", enabled when the chosen model takes images. |
+| Tests | Config hashing for the new fields. Nothing else. |
+
+Steps:
+
+- [x] 1. `ParseConfig.pictures`, `picture_min_side`; the parser writes the picture files; the hash rule.
+- [x] 2. `Chunk.image` and the `picture` modality; `chunking/pictures.py`; the chunk summary and the Upload preview.
+- [x] 3. `OllamaEmbedder` takes image inputs; `embed_chunks` builds them from `picture_input`; a check that an image input's vector differs from the text-only one.
+- [x] 4. `index_chunks` payload, `Hit.image`, `ui/hits.py`, the *Content* filter, the CLI's `--modality picture`.
+- [x] 5. `library.py`; `CLAUDE.md` (Scope, modalities, the embed request shape and its trap).
+
+**Done when:** the FAA chapter (13 pictures) is ingested with pictures on and `embeddinggemma-2:740m`; for five questions about what a figure shows, written by you, the right picture is in the top 5 with *Content* set to `picture`; its rank in an unfiltered search and the scores of the best text and best picture hit are recorded here; the same five are run with `picture_input = caption` for comparison; and deleting the document removes its picture files. Checked once.
+
+Built differently from the draft:
+
+- **The pictures are cropped by us, not by Docling.** Docling already records every picture and its box in the parsed document, so `parsing/pictures.py` renders the page with pypdfium2 and crops it. A document that is already parsed (the Upload page's cache, parsed once with the defaults) gets its pictures in about a second instead of going through Docling again, there is no third and fourth cached parse variant, and the parse file does not grow. `generate_picture_images` stays off.
+- `picture_min_side` is in PDF points (50, about 18 mm), not pixels, so it does not depend on `picture_scale` (a new setting, 2.0).
+- Which pictures are kept is one rule, `kept_pictures(doc, parse_cfg)`, used by the parse stage (to save the files) and by the chunk stage (to make the chunks), so the chunker needs no listing of the folder.
+- A picture chunk's text is its headings and its caption when headings are added to chunk text (the default), like every other chunk. Its empty span sits at the end of the last text or table before the picture, and the Upload preview marks it there as a picture.
+- `Hit.image` is relative to `data/artifacts` (`<experiment>/parse/<doc_id>.pictures/<n>.png`), so a card, or a saved chat turn, finds the file without knowing the experiment; the payload keeps the path relative to the parse folder. The card inlines the picture as a JPEG at most 560 pixels wide (23 to 83 kB each; as PNG five cards were 1.5 MB of HTML) and shows nothing when the file is gone.
+- The parse meta has no picture count: the chunk summary's `by_modality` and the `embed` stage row (`pictures`, `picture_input`) say how many there were.
+- I wrote the five questions (the plan says you would), after looking at the pictures, so that each describes what is seen and not the caption. Replace them with your own if you want a fairer test.
+- All three ways of embedding were run, not only `caption`.
+
+**Result (checked on the real stack; `embeddinggemma-2:740m`, native 768, BM25 on):**
+
+- The Upload page through the app tester: the pictures box is disabled with a Qwen3 model and enabled with EmbeddingGemma 2; Chunk gave 64 chunks (51 text, 13 picture) and wrote 13 picture files (115 kB to 1.2 MB); the preview drew the 13 pictures; Embed and index wrote `up-afh-ch18-pictures` (64 points). Four of the 13 pictures have no caption in the parse, so their text is only "Figure on page N".
+- The trap: for the same picture, the vector made from image and caption has cosine 0.894 with the vector made from the caption alone, and the image-only vector 0.697, so the image does reach the model. The 51 text chunks are identical in all three (1.0000).
+- The five questions, and where the right picture came:
+
+| Question (the picture) | image+caption: among pictures / in all chunks | image: pictures / all | caption: pictures / all |
+|---|---|---|---|
+| an airplane flying low over farm fields (page 5, no caption) | 1 / 1 | 1 / 1 | 7 / 43 |
+| chart of stopping distance at 50 mph and 100 mph (Figure 18-2) | 1 / 1 | 1 / 2 | 1 / 1 |
+| an airplane in a steep spiral descending turn (page 9, no caption) | 1 / 1 | 1 / 6 | 3 / 6 |
+| what the airspeed indicator, altimeter and vertical speed indicator show when the pitot or static source is blocked (page 15, no caption) | 1 / 1 | 1 / 1 | 1 / 4 |
+| an airplane resting in tall grass after landing (Figure 18-1) | 1 / 1 | 1 / 1 | 5 / 31 |
+
+- So with the image and the caption together the right picture is first of the 13 for all five, and first of all 64 chunks too; the image alone is as good among pictures and a little lower among all chunks; the caption alone finds a picture only when its caption says what it shows. Scores of the right picture, image+caption: 0.74 to 0.84. **The modality gap did not show here**: a question that describes a picture ranked that picture above every text chunk, so no correction was needed. A question about the text is not disturbed: the door question returns five text chunks, "Door Opening In-Flight" first.
+- Embedding the 64 chunks took 13 s with the images against 4 s with captions only.
+- Try a query through the app tester: *Content* offers `picture`; with it the five cards each draw their picture.
+- Deleting the document from an experiment removed its 13 picture files and the folder with its other files; the two comparison experiments were then deleted.
+- The 48 tests pass (two new: the picture settings are in the hash only with pictures on; pictures as images are refused for a model that takes no images, and allowed as captions).
+- Not run: pictures through Dagster (`parse_pdf` with `parse.pictures` calls the same `save_pictures` the page calls, but no Dagster run was made), and pictures on a scanned PDF together with OCR. Not seen by eye: the cards and the preview in a browser.
+- Small sample: five questions, 13 pictures, one document, all photographs or diagrams with little text in them. The pitot-static picture is really a table drawn as an image, and it was found from its content, which is promising for scanned tables but is one case.
+- Kept for you to look at: the experiment `up-afh-ch18-pictures`.
+
+### Phase 32 — The chatbot looks at the pictures
+
+**Goal:** when a retrieved chunk is a picture, the answer model sees the image, not only its caption. `gemma4:e4b-mlx` reports the `vision` capability.
+
+| Decision | Choice |
+|---|---|
+| Where | `generate` only: the images of the picture hits among the top k are attached to the answer message, numbered like their chunks. `grade` and `rewrite` stay on text. |
+| Setting | `AgentConfig.show_pictures: bool = True`, and at most `max_pictures` (2) images a turn, because each costs context; the `ModelState` event already shows prompt tokens against `num_ctx`. |
+| A model without vision | The toggle is off for it, as the Thinking toggle is for a model that cannot think. |
+| Saved turns | Unchanged: the hits carry the image path, and the image is read again on replay. |
+| Tests | None. |
+
+Steps:
+
+- [x] 1. `agent/documents/graph.py` attaches the images; `AgentConfig`; the page's toggle.
+- [x] 2. `CLAUDE.md`.
+
+**Done when:** a question that only a figure answers (for example what a diagram's labels say) is answered from the picture with its `[n]` cited, and the same question with the toggle off is not. Checked once.
+
+Built differently from the draft:
+
+- **The passage number is drawn onto the picture.** The model read the pictures correctly from the first try, but would not cite one by its passage number: it wrote `[Table in the image]` or `[Table]`, and once "which is not a numbered passage". Five wordings were tried (the picture named in its passage, a reminder before the question, after the question, a rule in the system prompt, a short "the attached image is passage [4]"), with thinking on and off, and none changed it; with the rule in the system prompt and thinking on it even refused to use the picture. So each picture is sent with a white strip above it that says `Passage [n]` (`graph.py: labelled`). With that it cited `[4]` and `[1]` in every run, and with two pictures attached it cited the right one.
+- The page marks the cards of the pictures the model was given ("image given to the model"), worked out from the turn's saved settings by the same rule the agent uses (the first `max_pictures` picture hits), so a saved turn needs no new event. The settings line under an answer says "up to 2 pictures shown to the model".
+- `data.chat_models()` returns each model's capabilities instead of only whether it can think, since the page now asks about `vision` too.
+- The CLI got `--no-pictures`.
+
+**Result (checked on the real stack; `up-afh-ch18-pictures`, `gemma4:e4b-mlx`):**
+
+- "In the figure about turning back to the runway after engine failure, what distances and angles are labelled?" The figure (Figure 18-5) was the first hit (reranker 1.000, from its caption). With pictures on the answer was "300 feet AGL, 4,480 feet, 1,016 feet, 180°, and 225° [1]": all five labels, cited to the picture. The 4,480 feet is nowhere in the document's text. With pictures off: "The documents do not contain information about what distances and angles are labelled in the figure".
+- "What do the airspeed indicator, altimeter and vertical speed indicator show when both static sources are blocked?" The answer is a row of a table that exists only as a picture with no caption (page 15). With pictures on the model read the row correctly (airspeed decreases with altitude gain and increases with altitude loss; altitude and vertical speed do not change) and cited `[4]`; with pictures off it answered from a text passage about a partly restricted static system, which is a different case.
+- Cost: about 600 prompt tokens a picture (2,276 against 1,056 with two pictures), no slower to answer.
+- The Chatbot page through the app tester: the *Show pictures to the model* toggle is on for `gemma4:e4b-mlx`; the turn-back question was answered from the figure with `[1]` cited; of the three picture cards two carry "image given to the model"; a refresh on the same chat shows the same; with the toggle off the answer says it has no figure and no card carries the mark.
+- **The limit that remains is retrieval, not reading.** The pitot-static picture reached the model only because it came 4th with a reranker score of 0.029: the reranker judges a picture by its text, which for a picture without a caption is "Figure on page 15". With more competing text it would have been dropped before the model could see it. Reading the text inside a picture at ingest (Ideas) would fix that.
+- Not seen by eye: the toggle and the marked cards in a browser. Not tried: a chat model without vision (the toggle is disabled from the capability Ollama reports, which was not exercised).
+- Two questions, one document, one chat model. Kept for you to look at: the chat with the turn-back question (pictures on), on `up-afh-ch18-pictures`.
+
+### Decided
+
+- OCR reads only the regions that have no text layer; a page with one keeps its text.
+- OCR is glm-ocr only; Docling's CPU engines (RapidOCR is in the image) stay off, so there is no fallback when Ollama is unreachable: the parse fails with a message.
+- A picture is embedded as its image and caption together, as one input. `image` and `caption` alone stay as settings, for the comparison in Phase 31's "Done when".
+- The chatbot sees the picture itself, not only its caption: Phase 32 is part of the plan.
+
+### Open choices (defaults used above unless you say otherwise)
+
+- Pictures are off in the Benchmark.
+- One set of pure-logic tests is proposed (the HTML table step, only if we write our own reader).
+
+### Risks
+
+- **glm-ocr not stopping.** If no stop rule is reliable, OCR costs 17 s a region instead of about 1 s, which is not usable. Step 1 of Phase 29 settles this before anything is built on it.
+- **Layout on scanned pages.** The quality of the regions decides the quality of the text: a merged or missed region is text read in the wrong order or not at all. The "Done when" comparison with the text layer measures it on one clean document; a real scan (skewed, noisy) will be worse.
+- **Languages.** Only English was looked at. Thai and others need their own look, and BM25 already needs a word segmenter for them.
+- **The modality gap** may keep pictures out of an unfiltered top k altogether. Phase 31 measures it; the fix is under Ideas.
+- **Small evidence for the embedding model.** Two coloured squares show the direction, not the quality. The five figure questions are the first real evidence.
+- **Memory on the Mac.** OCR, the embedding model, the reranker and the chat model are now four models on one Ollama; the swapping seen in Phase 18 gets more likely.
+
+## Automatic ingestion from data/raw (Phase 33)
+
+**Goal:** a PDF put into `data/raw/` is ingested with no click: the sensor sees it, starts `ingest_job` for it, and the job runs parse, chunk, embed and index into Qdrant with the settings written in one YAML file.
+
+### What exists today, and what was checked
+
+- `new_pdf_sensor` (every 30 s, on by default) registers each PDF in `data/raw` as a Dagster partition, keyed by the hash of its bytes. **It starts no runs.**
+- `ingest_job` runs the four assets for a partition, but only when it is launched by hand with `resources.experiment.config` typed into the launchpad.
+- Runs execute in the `dagster-code` container (Dagster 1.13.25, `DefaultRunLauncher`), which already mounts `./data`, so a run started by the sensor can read the PDF and write the artifacts. The run coordinator is already the queued one, but with its default limit, so several PDFs dropped together would run at the same time.
+- A sensor result can add a partition and request a run for it in the same tick (`SensorResult(run_requests=..., dynamic_partitions_requests=...)`), and a `RunRequest` carries its own `run_config`, `run_key` and `partition_key`.
+- PyYAML 6.0.3 is in the image (other packages bring it) but is not declared in `pyproject.toml`.
+- `data/raw` holds 5 PDFs now (the FAA chapter, `handbook.pdf`, `sample-report.pdf`, `sample-scanned.pdf`, `The Myth of Sisyphus`), and 7 partitions are registered (two for files no longer there).
+- `dagster.yaml` is copied into the image, not mounted, so a change to it needs `docker compose up -d --build`.
+
+### Architecture
+
+```
+config/ingest.yaml  --read at every tick-->  new_pdf_sensor  --RunRequest(partition, run config, run key)-->  ingest_job
+     (the experiment:                              |                                                              |
+      name, parse, chunk,                  data/raw/*.pdf                                  parsed_document -> chunks -> embeddings -> qdrant_index
+      embed, index)                     (complete files only)                              (one run at a time; the collection is the YAML's `name`)
+```
+
+The YAML is one experiment: the same keys as the launchpad's `resources.experiment.config`. The sensor turns it into the run config of each run it starts, written out in full, so a run in the Dagster UI shows exactly what it ran with and a later edit of the file does not change it.
+
+```yaml
+# config/ingest.yaml: what a PDF put into data/raw is ingested with. A key left out keeps its default;
+# an unknown key is an error. Changing a setting means changing `name` too (a new experiment).
+name: auto-ingest
+parse:
+  ocr: false            # true reads scanned pages with glm-ocr
+  pictures: false       # true needs an embedding model that takes images
+chunk:
+  strategy: hybrid
+  max_tokens: 512
+embed:
+  model: qwen3-embedding:0.6b
+index:
+  sparse: true          # a BM25 vector, so the Chatbot and hybrid search can use the experiment
+```
+
+| Decision | Choice |
+|---|---|
+| The file | `config/ingest.yaml`, committed, mounted read-only into `dagster-code` at `/app/config`; its path is `INGEST_CONFIG` (compose sets it). One file, one experiment. |
+| Loading | `load_experiment_file(path)` in `config.py`: `yaml.safe_load`, then `ExperimentConfig.model_validate`, which already refuses unknown keys and bad values and names them. Plain Python, so the same function can be used outside Dagster. |
+| The embedding family | When `embed` names a model and does not set the tokenizer or the templates, they are filled from the model's family (`EmbedConfig.for_model`). So `model: embeddinggemma-2:740m` alone is right, which the launchpad form is not. |
+| The tag | `tag` defaults to `name`, as the Upload page and the benchmark do, so the experiment has a hash of its own. |
+| When it is read | At every sensor tick, so an edit takes effect for the next PDF with no restart. A file that does not load fails the tick: the error shows on the sensor in the Dagster UI and nothing runs until it is fixed. |
+| **Which PDFs run** | **Only PDFs that arrive after this is switched on** (decided). New means not yet a partition, which is what the sensor has always meant by it: the 5 PDFs already in the folder are partitions, so they start nothing, and neither does the same file under another name. A changed `name` in the YAML applies to the PDFs that arrive after it; nothing already ingested is done again. An older PDF is ingested by launching `ingest_job` for its partition by hand. |
+| **Settings changed, name not** | Refused. Before it requests anything the sensor compares the YAML's `settings_hash()` with the experiment already recorded under that name; if they differ it starts no run and the tick says to change `name`. Without this, chunks made with different settings would share a collection, or the index step would fail on a different vector size. |
+| A file still being copied | A PDF is taken only when it is complete: its last kilobyte holds `%%EOF`. A file that is not there yet is looked at again at the next tick. Its id is hashed only then, so a half-copied file never becomes a partition. Modification time and size are not used: Windows keeps the source's time on a copy and can reserve the full size at the start (step 1 checks what a copy in progress looks like through the Docker mount). |
+| One run at a time | `dagster.yaml` limits the run queue to one run, so PDFs dropped together are ingested one after another: each run loads Docling's models, and there is one Ollama. This also applies to runs launched by hand. |
+| What a run is labelled with | Tags `experiment` and `source_file`, so the runs list reads as "which file into which experiment". |
+| A run that fails | Stays failed; its PDF is a partition by then, so the sensor does not start it again. *Re-execute* on the run in the Dagster UI repeats it with the same config. (A scanned PDF with `ocr: false` fails at `chunks` with "No chunks produced", as now.) |
+| Removing a PDF from `data/raw` | Does nothing: its points stay in the experiment. The Experiments page deletes a document. |
+| The Upload page | Unchanged. It still writes to `data/uploads`, which the sensor does not watch. |
+| Code layout | The sensor moves to `assets/sensors.py` (it now needs `ingest_job`, and `jobs.py` imports the partitions from `partitions.py`). The assets do not change. |
+| Dependency | `pyyaml` is declared in `pyproject.toml`; it is already installed. |
+| Tests | **For you to approve:** one small test of `load_experiment_file` (a key left out keeps its default, an unknown key is refused, the family fill for `embeddinggemma-2`, `tag` defaulting to `name`), because a silent mistake there ingests every document with the wrong tokenizer or prompts. Nothing else. |
+
+### Steps
+
+- [x] 1. Check on this machine what a large PDF looks like to the container while Windows is still copying it into `data/raw` (size, last bytes), and that the `%%EOF` rule waits for it.
+- [x] 2. `load_experiment_file` in `config.py`; `config/ingest.yaml` with today's defaults; `pyyaml` in `pyproject.toml`.
+- [x] 3. `assets/sensors.py`: read the YAML, the settings guard, complete files only, partitions and run requests with run key, run config and tags. `definitions.py` and `partitions.py` follow.
+- [x] 4. `docker-compose.yml`: mount `./config` read-only into `dagster-code` and set `INGEST_CONFIG`. `dagster.yaml`: one run at a time. `docker compose up -d --build`.
+- [x] 5. `CLAUDE.md` (the sensor, the YAML, the run key rule, the commands) and README ("Batch ingestion with Dagster").
+
+**Done when,** on the real stack (rewritten for the decision that only new arrivals run): (a) the PDFs already in `data/raw` start nothing; (b) a PDF copied into `data/raw` gets a run within a minute, the run's config in the Dagster UI equals the YAML, and a search of `auto-ingest` finds its text; (c) two PDFs copied together run one after the other; (d) with a chunk setting changed in the YAML and `name` left alone, a new PDF starts no run and the sensor's tick says why, and it runs once the file is put right; (e) with `name` changed (and `embed.model: embeddinggemma-2:740m`, `parse.pictures: true`, which also runs pictures through Dagster for the first time), a new PDF goes into the new experiment, nothing older is ingested again, and a picture search finds a figure; (f) a misspelled key stops the tick with a message that names it. Checked once.
+
+Built differently from the draft:
+
+- **Only new arrivals run** (your decision), so there is no backfill of the folder and a changed `name` does not re-ingest it. The rule is the sensor's own old rule, "not yet a partition", so nothing new had to be remembered. The run key (`<name>:<doc_id>`) is still set, as a second guard against a run starting twice.
+- **A run is one process.** The first automatic run took 204 s for a two-page PDF, of which the four steps took 31 s: with Dagster's default executor every step starts a process of its own, and each imports Docling again (about 45 s). `ingest_job` now uses the in-process executor, and the same kind of PDF takes 29 to 48 s. This also applies to runs launched by hand.
+- **`dagster.yaml` is mounted, not rebuilt.** The plan said the change needs `docker compose up -d --build`. Declaring `pyyaml` changes `pyproject.toml`, and a build would then reinstall every dependency (none are pinned), so the three Dagster services mount `docker/dagster/dagster.yaml` over the copy in the image instead: `docker compose up -d` was enough, and a later edit needs a restart, not a build. The next real build will still reinstall the dependencies, as any change to `pyproject.toml` does.
+- **A file Windows is still copying cannot be opened at all.** Step 1: during a 1.5 GB copy into the data folder the container got "permission denied" for the whole 2.6 s, then the complete file. So the sensor treats a file it cannot read as not complete; the `%%EOF` check stays for a program that writes a file bit by bit.
+- The YAML is read only at a tick that finds a new PDF, not at every tick: a broken file is harmless until something arrives, and then fails that tick.
+- A YAML that does not load, or that names an experiment with other settings, fails the tick (red on the sensor, with the reason) instead of skipping it quietly; the PDF is not registered, so it runs at the first tick after the file is put right.
+- `load_experiment_file` refuses a model of no known family (a misspelled model name would otherwise be found only when Ollama is called), unless the file sets the tokenizer and both templates itself.
+- The run config leaves out the settings that are `None` (`embed.dimension`, `index.hnsw_ef`); a run config that names every other value is what the Dagster UI shows.
+- Two tests for the loader, in the config tests (50 tests in all).
+
+**Result (checked on the real stack, with six small PDFs cut from the FAA chapter, each with its own content hash):**
+
+- (a) After the change the sensor's ticks say "No new PDFs." and no run started for the 5 PDFs in the folder.
+- (b) A PDF copied in at 15:59:41 had its run started at 16:00:09. The run's config equals the YAML, its tags are the experiment and the file name, and "what to do when a door opens in flight" on `auto-ingest` returns its "Door Opening In-Flight" chunk first (0.768).
+- (c) Two PDFs copied in together: one run 16:07:42 to 16:08:30, the other 16:09:05 to 16:09:34, so one after the other (the queue is limited to one run).
+- (d) With `chunk.strategy` changed to `fixed` and the name left as `auto-ingest`, a new PDF started nothing and the tick failed with "An experiment named 'auto-ingest' already exists with other settings. Settings cannot change under the same name: choose a new `name` (a new experiment), or put the settings back. Not started: t33-guard.pdf." With the file put back it ran at the next tick.
+- (e) With `name: auto-ingest-pictures`, `embed.model: embeddinggemma-2:740m` and `parse.pictures: true`, a new four-page PDF was ingested into the new experiment in 59 s (12 points, pictures among them) and nothing older was ingested again. "a diagram of an airplane turning back to the runway" with pictures only returns Figure 18-5 first (0.777). This is also the first run of pictures through Dagster, and it shows the family fill: the file names only the model.
+- (f) With `chunk.stratgy`, the tick failed with "/app/config/ingest.yaml: chunk.stratgy: Extra inputs are not permitted", and the PDF ran once the key was corrected.
+- Time: a two-page PDF takes 29 to 48 s as a run; from the copy to the start of the run is 30 to 70 s (the sensor's 30 s interval, then the queue and the start of the run's process).
+- Cleaned up afterwards: the six test PDFs, their partitions and the two test experiments (`auto-ingest`, `auto-ingest-pictures`) are removed, and `config/ingest.yaml` is the default again, so your first PDF makes `auto-ingest`. The six runs stay in Dagster's run list.
+- Not seen by eye: the runs and the sensor's ticks in the Dagster UI (read through its GraphQL API). Not tried: OCR through the sensor (`parse.ocr: true`), and a run that fails.
+
+### Found in use: a long document was cut, and the run said success
+
+The first real document through the sensor, `Homer-Odyssey.pdf` (444 pages, a text layer of 792,142 characters), gave 40 chunks in a run marked as a success.
+
+- **Cause.** Docling stops at `parse.document_timeout` (600 s) and returns what it has, with the status `partial_success`; LlamaIndex's `DoclingReader` hands on only the document, so the status was lost and `ParsedDocument.status` said "success" whatever happened. The parse had reached page 38 of 444 (63,533 characters, 8% of the book). This PDF takes 3 to 7 s a page on this CPU (20 pages: 68 to 135 s, with the table stage on, fast or off, so it is not the tables), and 10 to 15 s a page while the UI container was also busy; the FAA chapter takes about 1 s a page.
+- **Fix 1: a parse is whole or it fails.** `parse.py: RecordingConverter` keeps the conversion result, and `parse_pdf` raises when the status is not `success`, saying how many pages have content, the limit, and which settings to raise. It writes nothing. Checked by forcing a 25 s limit on the book: "Docling did not finish Homer-Odyssey.pdf (… document timeout exceeded): it has content for 0 of 444 pages after 40 s, with a limit of 25 s. Nothing was kept. Raise `parse.page_timeout` …", and no files.
+- **Fix 2: the limit follows the size of the document.** New `ParseConfig.page_timeout` (20 s): the limit is `document_timeout` or `page_timeout` for each page, whichever is longer, so 444 pages get 8,880 s. It is left out of the config hash while it is the default, so no experiment's hash changed (the pinned-hash test passes; 50 tests).
+- **Result.** The run was re-executed in Dagster with the same config. `parsed_document` now took 1,471 s (24.5 minutes, 3.3 s a page) and has all 444 pages (1,700 characters a page); `chunks` gave 477 chunks (460 text, 16 table, 1 picture). **`embeddings` then failed: "Ollama embed failed after 3 attempts".** The Mac that runs Ollama went offline on Tailscale during the parse (`tailscale status`: offline, last seen 18 minutes before; no reply to a ping). Nothing is wrong with the chunks; the step could not reach the model.
+- **What is left.** The collection still holds the old 40 points of this document. When the Mac is back, *Re-execute from failure* on run `3c81827f` in the Dagster UI runs only `embeddings` and `qdrant_index` from the files on disk (a minute or two, no second parse), and replaces the 40 points with the 477.
+
+### Open choices (defaults used above unless you say otherwise)
+
+- One YAML, one experiment. Several experiments from one drop (a list in the file) is under Ideas.
+- One run at a time, for all Dagster runs.
+- `sparse: true` in the committed file, so the Chatbot can use what is ingested. The code default stays false.
+- One test is proposed for the loader; say if you would rather have none.
+- This is one YAML file for one purpose. It does not move the code's defaults into YAML: that larger question stays open in the next section, and this file fits its option B3 (a file is an experiment) if you choose it.
+
+### Risks
+
+- **A long run holds the queue.** With `ocr: true` a 23-page scan takes about 7 minutes, and everything behind it waits.
+- **An older PDF is never picked up by itself.** That is the decision; it means the 5 PDFs in the folder, a PDF whose run failed, and the PDFs of an experiment deleted on the Experiments page all need a launch by hand, with the config typed into the launchpad. Prefilling it from the YAML is under Ideas.
+- **The copy check is a heuristic.** A PDF that does not end in `%%EOF` within its last kilobyte is never taken. It would sit in the folder with nothing said, so the sensor's tick lists the files it is waiting for.
+
 ## Config in YAML (options; to be decided)
 
 **What was asked:** the parameters of the system in YAML, not in Python. This section lists the ways to do it, with one file and with several, and what each costs. Nothing here is built; the choice is yours, and a phase is written from it (see "After you choose").
@@ -1002,7 +1393,7 @@ Keep the project minimal. Testing is deliberately light:
 
 - **Documents:** PDF with a text layer.
 - **Tables:** CSV files imported into PostgreSQL, one schema per dataset (Phases 21 to 28, planned).
-- **Content:** text and tables. Image and figure ingestion and OCR are deferred (see "Deferred").
+- **Content:** text and tables. OCR for scanned PDFs (Phase 29) and pictures as searchable chunks (Phase 31) are built, both off by default; the chatbot's model is shown the pictures it retrieves (Phase 32).
 - **Hardware:** no NVIDIA GPU on this machine. Docling runs on CPU; Ollama runs where `OLLAMA_BASE_URL` points.
 
 ## Ideas
@@ -1012,6 +1403,7 @@ Not planned and not in any phase. Each is built only when you ask for it.
 - Text-to-SQL: per-schema reader roles, so the database and not only the guard keeps one dataset from reading another (today the reader may select from every schema in `rag_data`; one role per schema, made by the bootstrap since the loader cannot create roles, and the executor switching to it with `SET LOCAL ROLE`); retrieval of the relevant tables, for when a schema is too large to show the model whole (a Qdrant collection `schema__<name>` with a point per table, embedded from its catalog text; `tables_k` tables retrieved per question, all of them when the schema is small; `library.py` ignoring that prefix); a button that drafts table and column descriptions with the chat model; declared relationships between tables; appending rows on re-import; importing through a Dagster job; a result download button; a chart of a result.
 - Chatbot: a "Performance" page or tab over `chat_turns` (time per step, tokens per second, abstain rate and score by settings, slowest turns), and renaming or pinning a chat.
 - Chatbot: a tool-calling variant where the model chooses between searching, searching one document (`source_file` filter) and answering directly; a groundedness check that verifies each cited claim against its chunk; a Postgres checkpointer and a page of past chats; restricting a chat to chosen documents.
+- Automatic ingestion (after Phase 33): several experiments from one drop (a list in `config/ingest.yaml`); removing a document's points when its PDF leaves `data/raw`; the launchpad of `ingest_job` prefilled from the YAML for a run started by hand; retrying a failed run automatically.
 - A "Process with Dagster" option on the Upload page: copy the PDF to `data/raw/`, register its partition, launch `ingest_job` with the page's settings (and `tag`) as run config, and link to the run. The run would then show in the Dagster UI, at the cost of the page's chunk preview.
 - Benchmark: several documents in one report; test queries generated by a local LLM from the document's own text; a Unicode font in the PDF so names with other characters are not replaced with `?`.
 - Try a query: restrict the search to one document of an experiment (`source_file` already has a payload index).
@@ -1019,13 +1411,13 @@ Not planned and not in any phase. Each is built only when you ask for it.
 - On the upload page: parse options (`table_mode`, formulas), and picking a document already in `data/raw`.
 - Parsing for the upload page as a Dagster run (a partition and `parsed_document`) instead of inside the Streamlit process, so it shows in the Dagster UI and does not use the UI container's memory.
 - One `IngestionPipeline` with a docstore, to skip unchanged documents and dedupe chunks (see Phase 8 in `COMPLETED_PLAN.md`; it conflicts with per-stage files, so it would be a separate fast path).
-- Embedding models outside the Qwen3 family.
+- OCR and pictures (after Phases 29 to 32): OCR of a page that has a text layer, for a PDF whose text layer is broken; several OCR calls at once; the text inside a picture (a chart's labels) read with `Text Recognition:` and added to the picture chunk's text, which would help BM25 and the reranker; a reserved number of picture hits in a mixed search (a second `Prefetch` filtered to `modality = picture`), if the modality gap keeps pictures out of the top k; whole pages embedded as images; pictures in the Benchmark, with test queries that name a picture.
+- Embedding model families beyond Qwen3 and EmbeddingGemma 2 (a new row in the family table of Phase 30).
 - Quantisation settings in Qdrant.
 - `--exact` search to measure what HNSW gives up. See Phase 5 in `COMPLETED_PLAN.md`.
 - `docling-serve` as a separate container, compared against in-process parsing.
 
 ## Deferred
 
-- **Image and figure ingestion.** When wanted: enable picture extraction in `ParseConfig`, add a `picture` modality, and describe images with a vision model so they can be embedded as text.
-- **OCR** (scanned PDFs). Docling's OCR also runs on CPU, only slowly, so this is a speed trade-off rather than a hard limit. When wanted: expose `do_ocr`, `ocr_engine`, `ocr_languages` and `force_full_page_ocr` in `ParseConfig`.
+- **Image and figure ingestion** and **OCR** are no longer deferred: see Phases 29 to 32. What stays deferred from them: describing a picture in words with a vision model (pictures are embedded from the image instead), and Docling's own CPU OCR engines.
 - **Other document types** (DOCX, PPTX, HTML). Docling handles them; the sensor and `ParseConfig` would need format-specific options.

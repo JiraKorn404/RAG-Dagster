@@ -28,7 +28,7 @@ def main() -> None:
     parser.add_argument("query")
     parser.add_argument("--experiment", required=True)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--modality", choices=["text", "table"])
+    parser.add_argument("--modality", choices=["text", "table", "picture"])
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
     parser.add_argument("--no-log", action="store_true", help="do not write to search_log")
     args = parser.parse_args()

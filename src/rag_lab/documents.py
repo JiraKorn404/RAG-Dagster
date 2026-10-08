@@ -18,10 +18,23 @@ def doc_id_for(path: Path) -> str:
     return _hash_cache[key]
 
 
+def raw_pdfs() -> list[Path]:
+    return [p for p in sorted(RAW_DIR.iterdir()) if p.is_file() and p.suffix.lower() == ".pdf"]
+
+
+def is_complete_pdf(path: Path) -> bool:
+    """Whether the file can be read and ends as a PDF does (`%%EOF` in its last kilobyte). A file that
+    Windows is still copying into the folder cannot be opened from the container at all (permission
+    denied until the copy ends); the end marker covers a program that writes the file bit by bit."""
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, 2)
+            f.seek(max(size - 1024, 0))
+            return b"%%EOF" in f.read()
+    except OSError:
+        return False
+
+
 def scan_raw() -> dict[str, Path]:
     """doc_id -> path for every PDF in data/raw."""
-    return {
-        doc_id_for(p): p
-        for p in sorted(RAW_DIR.iterdir())
-        if p.is_file() and p.suffix.lower() == ".pdf"
-    }
+    return {doc_id_for(p): p for p in raw_pdfs()}

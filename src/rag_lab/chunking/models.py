@@ -7,7 +7,7 @@ from pathlib import Path
 class Chunk:
     doc_id: str
     text: str
-    modality: str  # "text" or "table"
+    modality: str  # "text", "table" or "picture"
     strategy: str
     page: int | None = None
     headings: list[str] = field(default_factory=list)
@@ -18,6 +18,8 @@ class Chunk:
     # preview. An empty span (start == end) means the chunk has no source text. Not stored in Qdrant.
     span: list[int] | None = None
     span_approx: bool = False  # the span is the region the chunk came from, wider than the chunk
+    # A picture chunk's file, relative to the parse folder: "<doc_id>.pictures/<n>.png"
+    image: str | None = None
 
 
 def write_chunks(chunks: list[Chunk], path: Path) -> None:

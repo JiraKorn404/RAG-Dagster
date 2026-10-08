@@ -79,6 +79,8 @@ button[data-baseweb="tab"] {{ font-weight: 600; }}
 .badge {{ font-size: .7rem; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid; }}
 .badge.text {{ color: #6da7ec; border-color: rgba(109,167,236,.45); background: rgba(57,135,229,.10); }}
 .badge.table {{ color: #e8a24b; border-color: rgba(232,162,75,.45); background: rgba(217,89,38,.12); }}
+.badge.picture {{ color: #e58bb0; border-color: rgba(213,81,129,.45); background: rgba(213,81,129,.12); }}
+.hit img.picture {{ display: block; max-width: 100%; border-radius: 8px; margin: 6px 0 8px 0; }}
 .badge.page {{ color: {INK_2}; border-color: rgba(255,255,255,.18); }}
 .badge.agree {{ color: #4cc9a0; border-color: rgba(76,201,160,.45); background: rgba(25,158,112,.12); }}
 .badge.solo {{ color: {MUTED}; border-color: rgba(255,255,255,.12); }}
